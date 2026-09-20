@@ -1,5 +1,7 @@
 # Nimble
 
+<img src="assets/nimble.png" width="96" alt="Nimble logo"/>
+
 A blazing fast, featherweight native notepad for Windows — written in Rust on raw Win32.
 
 ## Why

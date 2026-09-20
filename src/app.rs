@@ -112,10 +112,22 @@ pub fn run() {
         });
 
         let hinst = HINSTANCE::from(GetModuleHandleW(None).unwrap_or_default());
-        // Resource ID 1 becomes the app icon once nimble.ico is added to nimble.rc.
-        let icon = LoadIconW(Some(hinst), PCWSTR(1usize as *const u16))
+        // Resource ID 1 is nimble.ico; fall back to the stock app icon if absent.
+        let load_icon = |sx: SYSTEM_METRICS_INDEX, sy: SYSTEM_METRICS_INDEX| -> HICON {
+            LoadImageW(
+                Some(hinst),
+                PCWSTR(1usize as *const u16),
+                IMAGE_ICON,
+                GetSystemMetrics(sx),
+                GetSystemMetrics(sy),
+                LR_DEFAULTCOLOR,
+            )
+            .map(|h| HICON(h.0))
             .or_else(|_| LoadIconW(None, IDI_APPLICATION))
-            .unwrap_or_default();
+            .unwrap_or_default()
+        };
+        let icon = load_icon(SM_CXICON, SM_CYICON);
+        let icon_sm = load_icon(SM_CXSMICON, SM_CYSMICON);
 
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -123,7 +135,7 @@ pub fn run() {
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst,
             hIcon: icon,
-            hIconSm: icon,
+            hIconSm: icon_sm,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut c_void),
             lpszClassName: WND_CLASS,
@@ -462,6 +474,7 @@ impl App {
             sm(edit, EM_SETTARGETDEVICE, 0, if self.word_wrap { 0 } else { 1 });
             set_editor_font(edit);
             let _ = SetWindowSubclass(edit, Some(edit_proc), EDIT_SUBCLASS, self.hwnd.0 as usize);
+            sm(edit, EM_SETMODIFY, 0, 0);
 
             let mut doc = Document {
                 edit,
