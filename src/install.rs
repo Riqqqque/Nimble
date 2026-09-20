@@ -2,11 +2,12 @@
 //!
 //! `nimble.exe --install`   — per-user install into %LOCALAPPDATA%\Programs\Nimble,
 //!                            Start Menu shortcut, logon update entry, and an
-//!                            entry in Settings > Apps (Uninstall registry).
+//!                            entry in Settings > Apps (Uninstall registry),
+//!                            then launches the installed copy.
 //! `nimble.exe --uninstall` — removes everything installed above.
-//! `nimble.exe --update`    — runs the update script now (the Help menu uses
-//!                            this too). The app also runs it silently at
-//!                            launch when installed.
+//!
+//! The Help menu's "Check for Updates" runs update.ps1 directly, and the
+//! installed app runs it silently at every launch.
 //!
 //! The update script is plain PowerShell so the installed footprint stays a
 //! single exe. Updates run at logon (registry Run key — Task Scheduler needs
@@ -73,7 +74,10 @@ pub fn is_installed() -> bool {
 
 pub fn install() {
     match do_install() {
-        Ok(msg) => msgbox(&format!("Nimble {VERSION} installed.\n\n{msg}"), "Nimble", MB_ICONINFORMATION),
+        Ok(msg) => {
+            msgbox(&format!("Nimble {VERSION} installed.\n\n{msg}"), "Nimble", MB_ICONINFORMATION);
+            let _ = Command::new(install_dir().join("nimble.exe")).spawn();
+        }
         Err(e) => msgbox(&format!("Install failed: {e}"), "Nimble", MB_ICONERROR),
     }
 }
@@ -211,25 +215,47 @@ pub fn uninstall() {
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide(UNINSTALL_KEY).as_ptr()));
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, w!("Software\\Nimble"));
     }
-    // Self-delete: the running exe can't be removed, so hand off to a detached
-    // cmd that waits a beat, then deletes the binary and the directory.
+    // Self-delete: a running exe can't be deleted, but it CAN be renamed.
+    // Rename to nimble.exe.old up front, then hand off to a detached
+    // PowerShell that waits for this PID to exit, deletes the leftover, and
+    // removes the install dir only if empty — so a fast reinstall survives.
+    let exe = std::env::current_exe().unwrap_or_default();
+    let old = dir.join("nimble.exe.old");
+    let ours = exe.parent() == Some(dir.as_path());
+    if ours {
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&exe, &old);
+    }
     let _ = std::fs::remove_file(dir.join("update.ps1"));
     let _ = std::fs::remove_file(dir.join("version.txt"));
     let _ = std::fs::remove_file(dir.join("update.log"));
-    let _ = std::fs::remove_file(dir.join("nimble.exe.old"));
-    let exe = std::env::current_exe().unwrap_or_default();
-    let _ = Command::new("cmd.exe")
-        .args([
-            "/c",
-            &format!(
-                "ping 127.0.0.1 -n 3 > nul & del /q \"{}\" & rmdir \"{}\"",
-                exe.display(),
-                dir.display()
-            ),
-        ])
-        .creation_flags(0x0800_0000)
-        .spawn();
     msgbox("Nimble uninstalled.", "Nimble", MB_ICONINFORMATION);
+    let pid = std::process::id();
+    let target = if old.exists() { old } else { exe };
+    let cleanup = if ours {
+        format!(
+            "Remove-Item '{}' -Force -EA SilentlyContinue;if(-not(Get-ChildItem '{}' -Force -EA SilentlyContinue)){{Remove-Item '{}' -Force -EA SilentlyContinue}}",
+            target.display().to_string().replace('\'', "''"),
+            dir.display().to_string().replace('\'', "''"),
+            dir.display().to_string().replace('\'', "''"),
+        )
+    } else {
+        String::new()
+    };
+    if !cleanup.is_empty() {
+        let _ = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &format!(
+                    "for($i=0;$i -lt 90;$i++){{if(-not(Get-Process -Id {pid} -EA SilentlyContinue)){{break}};Start-Sleep 1}};{cleanup}"
+                ),
+            ])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
 }
 
 /// Silent background check at app launch — fire-and-forget so startup stays
