@@ -1,9 +1,9 @@
 use std::ffi::c_void;
 
-use windows::core::{s, w, BOOL, PCSTR, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Registry::*;
+use windows::core::{BOOL, PCSTR, PCWSTR, s, w};
 
 /// What the user picked in View > Theme.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,12 +45,13 @@ pub struct Theme {
     pub dark: bool,
     pub edit_bg: COLORREF,
     pub edit_fg: COLORREF,
-    pub chrome_bg: COLORREF,  // tab strip / status bar
-    pub tab_sel: COLORREF,    // selected tab fill
+    pub chrome_bg: COLORREF, // tab strip / status bar
+    pub tab_sel: COLORREF,   // selected tab fill — matches edit_bg so it merges
     pub tab_fg: COLORREF,
-    pub tab_dim: COLORREF,    // unselected tab text
+    pub tab_dim: COLORREF, // unselected tab text
+    pub tab_hot: COLORREF, // hovered inactive tab
     pub status_fg: COLORREF,
-    pub menu_bg: COLORREF,    // popup menu fill
+    pub menu_bg: COLORREF, // popup menu fill
     pub menu_fg: COLORREF,
     pub menu_hover: COLORREF, // hot item / strip hover
     pub menu_dim: COLORREF,   // grayed items and accelerators
@@ -67,7 +68,8 @@ pub fn light_theme() -> Theme {
         tab_sel: rgb(0xFF, 0xFF, 0xFF),
         tab_fg: rgb(0x1B, 0x1B, 0x1B),
         tab_dim: rgb(0x5F, 0x5F, 0x5F),
-        status_fg: rgb(0x40, 0x40, 0x40),
+        tab_hot: rgb(0xE4, 0xE4, 0xE4),
+        status_fg: rgb(0x5F, 0x5F, 0x5F),
         menu_bg: rgb(0xF9, 0xF9, 0xF9),
         menu_fg: rgb(0x1B, 0x1B, 0x1B),
         menu_hover: rgb(0xE0, 0xE0, 0xE0),
@@ -82,16 +84,17 @@ pub fn dark_theme() -> Theme {
         dark: true,
         edit_bg: rgb(0x20, 0x20, 0x20),
         edit_fg: rgb(0xE8, 0xE8, 0xE8),
-        chrome_bg: rgb(0x1A, 0x1A, 0x1A),
-        tab_sel: rgb(0x2D, 0x2D, 0x2D),
+        chrome_bg: rgb(0x19, 0x19, 0x19),
+        tab_sel: rgb(0x20, 0x20, 0x20),
         tab_fg: rgb(0xEC, 0xEC, 0xEC),
         tab_dim: rgb(0x9A, 0x9A, 0x9A),
-        status_fg: rgb(0xBD, 0xBD, 0xBD),
-        menu_bg: rgb(0x2B, 0x2B, 0x2B),
+        tab_hot: rgb(0x2A, 0x2A, 0x2A),
+        status_fg: rgb(0xA0, 0xA0, 0xA0),
+        menu_bg: rgb(0x26, 0x26, 0x26),
         menu_fg: rgb(0xEC, 0xEC, 0xEC),
-        menu_hover: rgb(0x41, 0x41, 0x41),
+        menu_hover: rgb(0x38, 0x38, 0x38),
         menu_dim: rgb(0x8A, 0x8A, 0x8A),
-        menu_sep: rgb(0x4A, 0x4A, 0x4A),
+        menu_sep: rgb(0x40, 0x40, 0x40),
         accent: rgb(0xE8, 0x55, 0x1E),
     }
 }
@@ -210,6 +213,41 @@ pub fn set_titlebar_dark(hwnd: HWND, dark: bool) {
     }
 }
 
+/// Tints the title bar to match the theme (Win11; silently ignored elsewhere).
+/// 35 = DWMWA_CAPTION_COLOR, 36 = DWMWA_TEXT_COLOR.
+pub fn set_titlebar_color(hwnd: HWND, caption: COLORREF, text: COLORREF) {
+    unsafe {
+        let Ok(dwm) = GetModuleHandleW(w!("dwmapi.dll")) else {
+            return;
+        };
+        let Some(f) = GetProcAddress(dwm, s!("DwmSetWindowAttribute")) else {
+            return;
+        };
+        let f: unsafe extern "system" fn(HWND, u32, *const c_void, u32) -> i32 =
+            core::mem::transmute(f);
+        let _ = f(hwnd, 35, &caption as *const COLORREF as *const c_void, 4);
+        let _ = f(hwnd, 36, &text as *const COLORREF as *const c_void, 4);
+    }
+}
+
+/// Rounded corners for popup menu windows (Win11 composes them smoothly;
+/// harmless on older builds).
+/// 33 = DWMWA_WINDOW_CORNER_PREFERENCE, 2 = DWMWCP_ROUND.
+pub fn round_corners(hwnd: HWND) {
+    unsafe {
+        let Ok(dwm) = GetModuleHandleW(w!("dwmapi.dll")) else {
+            return;
+        };
+        let Some(f) = GetProcAddress(dwm, s!("DwmSetWindowAttribute")) else {
+            return;
+        };
+        let f: unsafe extern "system" fn(HWND, u32, *const c_void, u32) -> i32 =
+            core::mem::transmute(f);
+        let v = 2u32;
+        let _ = f(hwnd, 33, &v as *const u32 as *const c_void, 4);
+    }
+}
+
 /// Applies (or clears) the "DarkMode_Explorer" visual style on a control —
 /// gives dark scrollbars, buttons, etc. when supported.
 pub fn set_control_dark(hwnd: HWND, dark: bool) {
@@ -220,8 +258,7 @@ pub fn set_control_dark(hwnd: HWND, dark: bool) {
         let Some(f) = GetProcAddress(ux, s!("SetWindowTheme")) else {
             return;
         };
-        let f: unsafe extern "system" fn(HWND, PCWSTR, PCWSTR) -> i32 =
-            core::mem::transmute(f);
+        let f: unsafe extern "system" fn(HWND, PCWSTR, PCWSTR) -> i32 = core::mem::transmute(f);
         let name = wide0("DarkMode_Explorer");
         let _ = f(
             hwnd,

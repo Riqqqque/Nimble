@@ -18,11 +18,11 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{Interface, PCWSTR, w};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -75,7 +75,11 @@ pub fn is_installed() -> bool {
 pub fn install() {
     match do_install() {
         Ok(msg) => {
-            msgbox(&format!("Nimble {VERSION} installed.\n\n{msg}"), "Nimble", MB_ICONINFORMATION);
+            msgbox(
+                &format!("Nimble {VERSION} installed.\n\n{msg}"),
+                "Nimble",
+                MB_ICONINFORMATION,
+            );
             let _ = Command::new(install_dir().join("nimble.exe")).spawn();
         }
         Err(e) => msgbox(&format!("Install failed: {e}"), "Nimble", MB_ICONERROR),
@@ -136,15 +140,17 @@ fn create_shortcut(dir: &std::path::Path) -> std::io::Result<()> {
     let lnk = lnk_dir.join("Nimble.lnk");
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
-            .map_err(win_err)?;
+        let link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(win_err)?;
         let exe = dir.join("nimble.exe");
         let exe_w = wide(&exe.to_string_lossy());
         let dir_w = wide(&dir.to_string_lossy());
         let lnk_w = wide(&lnk.to_string_lossy());
         link.SetPath(PCWSTR(exe_w.as_ptr())).map_err(win_err)?;
-        link.SetIconLocation(PCWSTR(exe_w.as_ptr()), 0).map_err(win_err)?;
-        link.SetWorkingDirectory(PCWSTR(dir_w.as_ptr())).map_err(win_err)?;
+        link.SetIconLocation(PCWSTR(exe_w.as_ptr()), 0)
+            .map_err(win_err)?;
+        link.SetWorkingDirectory(PCWSTR(dir_w.as_ptr()))
+            .map_err(win_err)?;
         link.SetDescription(w!("Nimble")).map_err(win_err)?;
         let file: IPersistFile = link.cast().map_err(win_err)?;
         file.Save(PCWSTR(lnk_w.as_ptr()), true).map_err(win_err)?;
@@ -183,7 +189,11 @@ fn register_uninstall(dir: &std::path::Path) -> std::io::Result<()> {
                 return Err(std::io::Error::last_os_error());
             }
         }
-        for (name, val) in [("NoModify", 1u32), ("NoRepair", 1u32), ("EstimatedSize", size_kb)] {
+        for (name, val) in [
+            ("NoModify", 1u32),
+            ("NoRepair", 1u32),
+            ("EstimatedSize", size_kb),
+        ] {
             let vname = wide(name);
             let r = RegSetKeyValueW(
                 HKEY_CURRENT_USER,
@@ -266,7 +276,14 @@ pub fn update_check_async() {
     }
     let ps = install_dir().join("update.ps1");
     let _ = Command::new("powershell.exe")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File"])
+        .args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
         .arg(&ps)
         .arg("-Quiet")
         .creation_flags(0x0800_0000)
@@ -291,7 +308,12 @@ pub fn check_updates() -> Option<i32> {
 
 fn msgbox(text: &str, title: &str, flags: MESSAGEBOX_STYLE) {
     unsafe {
-        MessageBoxW(None, PCWSTR(wide(text).as_ptr()), PCWSTR(wide(title).as_ptr()), flags);
+        MessageBoxW(
+            None,
+            PCWSTR(wide(text).as_ptr()),
+            PCWSTR(wide(title).as_ptr()),
+            flags,
+        );
     }
 }
 

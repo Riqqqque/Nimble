@@ -1,4 +1,4 @@
-use windows::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP, CP_UTF8};
+use windows::Win32::Globalization::{CP_ACP, CP_UTF8, MultiByteToWideChar, WideCharToMultiByte};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
