@@ -19,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::document::Document;
 use crate::encoding::{self, Encoding};
+use crate::theme::{self, Theme, ThemeMode};
 
 const WND_CLASS: PCWSTR = w!("NimbleWindow");
 const CP_UTF16: u32 = 1200;
@@ -45,9 +46,10 @@ const IDM_ZOOM_IN: u32 = 302;
 const IDM_ZOOM_OUT: u32 = 303;
 const IDM_ZOOM_RESET: u32 = 304;
 const IDM_ABOUT: u32 = 400;
+const IDM_CHECK_UPDATES: u32 = 401;
+// Theme submenu IDs live in theme.rs (IDM_THEME_SYSTEM/LIGHT/DARK)
 const IDM_NEXT_TAB: u32 = 500;
 const IDM_PREV_TAB: u32 = 501;
-const ID_PLUS: u32 = 600;
 
 const EDIT_ID_BASE: usize = 4096;
 const TAB_SUBCLASS: usize = 1;
@@ -87,12 +89,50 @@ fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
 }
 
+#[inline]
+fn pt_in_rect(rc: &RECT, x: i32, y: i32) -> bool {
+    x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
+}
+
+/// Owner-draw data for one popup menu item; boxed and leaked for the life
+/// of the app — menus live as long as the process anyway.
+struct MenuItemData {
+    label: Vec<u16>,  // display text, '&' stripped, no accelerator
+    accel: Vec<u16>,  // shortcut text ("Ctrl+S") or empty
+    accel_col: i32,   // shared accelerator column width for its popup
+    sep: bool,
+    radio: bool,
+    submenu: bool,
+}
+
+/// One entry in the hand-drawn menu strip (File / Edit / View / Help).
+struct StripEntry {
+    label: Vec<u16>, // display text
+    key: u16,        // mnemonic, ASCII lowercase
+    menu: HMENU,
+    x: i32,
+    w: i32,
+}
+
+/// Everything build_menu produces: the strip entries plus handles kept for
+/// state updates (check marks, radio, enable/gray).
+struct MenuSet {
+    strip: Vec<StripEntry>,
+    popups: Vec<HMENU>, // every popup incl. the theme submenu
+    edit: HMENU,
+    view: HMENU,
+    theme: HMENU,
+}
+
 struct App {
     hwnd: HWND,
     tab: HWND,
-    plus: HWND,
     status: HWND,
-    edit_menu: HMENU,
+    menus: MenuSet,
+    menu_hot: i32,  // strip index under the cursor, -1 = none
+    menu_open: i32, // strip index whose popup is showing, -1 = none
+    plus_hot: bool, // cursor over the "+" new-tab glyph
+    menu_brush: HBRUSH,
     docs: Vec<Document>,
     active: Option<usize>,
     word_wrap: bool,
@@ -100,10 +140,16 @@ struct App {
     dpi: u32,
     font: HFONT,
     next_id: usize,
+    mode: ThemeMode,
+    theme: Theme,
+    status_text: [[u16; 96]; 5],
 }
 
 pub fn run() {
     unsafe {
+        let mode = theme::load_mode();
+        // Must run before any windows/menus exist for dark chrome to apply.
+        theme::set_preferred_app_mode(theme::effective_dark(mode));
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = LoadLibraryW(w!("msftedit.dll"));
         let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
@@ -145,10 +191,10 @@ pub fn run() {
             return;
         }
 
-        let menu = build_menu();
+        let menus = build_menu();
         let accel = create_accel();
 
-        let app = Box::new(App::new());
+        let app = Box::new(App::new(mode, menus));
         let app_ptr = Box::into_raw(app);
 
         let sdpi = GetDpiForSystem();
@@ -162,7 +208,7 @@ pub fn run() {
             scale(760, sdpi),
             scale(540, sdpi),
             None,
-            Some(menu),
+            None,
             Some(hinst),
             Some(app_ptr as *const c_void),
         );
@@ -184,49 +230,153 @@ pub fn run() {
     }
 }
 
-fn build_menu() -> HMENU {
-    unsafe {
-        let bar = CreateMenu().unwrap_or_default();
+/// Splits "Te&xt\tAccel" into (display label, accelerator text).
+fn split_item_text(text: &str) -> (String, String) {
+    let (name, accel) = text.split_once('\t').unwrap_or((text, ""));
+    (name.replace('&', ""), accel.to_string())
+}
 
+/// Appends an owner-drawn item. `data` is boxed and its pointer becomes the
+/// item's dwItemData — intentionally never freed (menu outlives the window).
+fn add_item(menu: HMENU, id: u32, text: &str, radio: bool, submenu: bool, checked: bool) {
+    let (label, accel) = split_item_text(text);
+    let d = Box::new(MenuItemData {
+        label: wide(&label),
+        accel: wide(&accel),
+        accel_col: 0,
+        sep: false,
+        radio,
+        submenu,
+    });
+    unsafe {
+        let _ = AppendMenuW(
+            menu,
+            MF_OWNERDRAW | MF_ENABLED | if checked { MF_CHECKED } else { MF_UNCHECKED },
+            id as usize,
+            PCWSTR(Box::into_raw(d) as *const u16),
+        );
+    }
+}
+
+fn add_sep(menu: HMENU) {
+    let d = Box::new(MenuItemData {
+        label: Vec::new(),
+        accel: Vec::new(),
+        accel_col: 0,
+        sep: true,
+        radio: false,
+        submenu: false,
+    });
+    unsafe {
+        let _ = AppendMenuW(
+            menu,
+            MF_OWNERDRAW,
+            0,
+            PCWSTR(Box::into_raw(d) as *const u16),
+        );
+    }
+}
+
+/// Submenu entries ("Theme") need SetMenuItemInfo: AppendMenuW can't combine
+/// MF_POPUP with MF_OWNERDRAW.
+fn add_submenu(menu: HMENU, sub: HMENU, text: &str) {
+    let (label, _) = split_item_text(text);
+    let d = Box::new(MenuItemData {
+        label: wide(&label),
+        accel: Vec::new(),
+        accel_col: 0,
+        sep: false,
+        radio: false,
+        submenu: true,
+    });
+    unsafe {
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("x"));
+        let pos = GetMenuItemCount(Some(menu)) - 1;
+        let mii = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE | MIIM_DATA,
+            fType: MFT_OWNERDRAW,
+            dwItemData: Box::into_raw(d) as usize,
+            ..Default::default()
+        };
+        let _ = SetMenuItemInfoW(menu, pos as u32, true, &mii);
+    }
+}
+
+fn strip_entry(text: &str, menu: HMENU) -> StripEntry {
+    let (label, _) = split_item_text(text);
+    let key = text
+        .chars()
+        .skip_while(|&c| c != '&')
+        .nth(1)
+        .unwrap_or(' ')
+        .to_ascii_lowercase() as u16;
+    StripEntry {
+        label: wide(&label),
+        key,
+        menu,
+        x: 0,
+        w: 0,
+    }
+}
+
+/// The menu bar is drawn by us (Win32 can't theme it), so this builds only
+/// the popups plus the strip entries used for hit-testing and labels.
+fn build_menu() -> MenuSet {
+    unsafe {
         let file = CreatePopupMenu().unwrap_or_default();
-        let _ = AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"));
-        let _ = AppendMenuW(file, MF_STRING, IDM_NEW_TAB as usize, w!("&New Tab\tCtrl+T"));
-        let _ = AppendMenuW(file, MF_STRING, IDM_NEW_WINDOW as usize, w!("New &Window\tCtrl+N"));
-        let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, MF_STRING, IDM_OPEN as usize, w!("&Open...\tCtrl+O"));
-        let _ = AppendMenuW(file, MF_STRING, IDM_SAVE as usize, w!("&Save\tCtrl+S"));
-        let _ = AppendMenuW(file, MF_STRING, IDM_SAVE_AS as usize, w!("Save &As...\tCtrl+Shift+S"));
-        let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, MF_STRING, IDM_CLOSE_TAB as usize, w!("&Close Tab\tCtrl+W"));
-        let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, MF_STRING, IDM_EXIT as usize, w!("E&xit"));
+        add_item(file, IDM_NEW_TAB, "&New Tab\tCtrl+T", false, false, false);
+        add_item(file, IDM_NEW_WINDOW, "New &Window\tCtrl+N", false, false, false);
+        add_sep(file);
+        add_item(file, IDM_OPEN, "&Open...\tCtrl+O", false, false, false);
+        add_item(file, IDM_SAVE, "&Save\tCtrl+S", false, false, false);
+        add_item(file, IDM_SAVE_AS, "Save &As...\tCtrl+Shift+S", false, false, false);
+        add_sep(file);
+        add_item(file, IDM_CLOSE_TAB, "&Close Tab\tCtrl+W", false, false, false);
+        add_sep(file);
+        add_item(file, IDM_EXIT, "E&xit", false, false, false);
 
         let edit = CreatePopupMenu().unwrap_or_default();
-        let _ = AppendMenuW(bar, MF_POPUP, edit.0 as usize, w!("&Edit"));
-        let _ = AppendMenuW(edit, MF_STRING, IDM_UNDO as usize, w!("&Undo\tCtrl+Z"));
-        let _ = AppendMenuW(edit, MF_STRING, IDM_REDO as usize, w!("&Redo\tCtrl+Y"));
-        let _ = AppendMenuW(edit, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(edit, MF_STRING, IDM_CUT as usize, w!("Cu&t\tCtrl+X"));
-        let _ = AppendMenuW(edit, MF_STRING, IDM_COPY as usize, w!("&Copy\tCtrl+C"));
-        let _ = AppendMenuW(edit, MF_STRING, IDM_PASTE as usize, w!("&Paste\tCtrl+V"));
-        let _ = AppendMenuW(edit, MF_STRING, IDM_DELETE as usize, w!("&Delete\tDel"));
-        let _ = AppendMenuW(edit, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(edit, MF_STRING, IDM_SELECT_ALL as usize, w!("Select &All\tCtrl+A"));
+        add_item(edit, IDM_UNDO, "&Undo\tCtrl+Z", false, false, false);
+        add_item(edit, IDM_REDO, "&Redo\tCtrl+Y", false, false, false);
+        add_sep(edit);
+        add_item(edit, IDM_CUT, "Cu&t\tCtrl+X", false, false, false);
+        add_item(edit, IDM_COPY, "&Copy\tCtrl+C", false, false, false);
+        add_item(edit, IDM_PASTE, "&Paste\tCtrl+V", false, false, false);
+        add_item(edit, IDM_DELETE, "&Delete\tDel", false, false, false);
+        add_sep(edit);
+        add_item(edit, IDM_SELECT_ALL, "Select &All\tCtrl+A", false, false, false);
 
         let view = CreatePopupMenu().unwrap_or_default();
-        let _ = AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&View"));
-        let _ = AppendMenuW(view, MF_STRING, IDM_WORD_WRAP as usize, w!("&Word Wrap"));
-        let _ = AppendMenuW(view, MF_STRING, IDM_STATUS_BAR as usize, w!("&Status Bar"));
-        let _ = AppendMenuW(view, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(view, MF_STRING, IDM_ZOOM_IN as usize, w!("Zoom &In\tCtrl+Plus"));
-        let _ = AppendMenuW(view, MF_STRING, IDM_ZOOM_OUT as usize, w!("Zoom &Out\tCtrl+Minus"));
-        let _ = AppendMenuW(view, MF_STRING, IDM_ZOOM_RESET as usize, w!("&Restore Default Zoom\tCtrl+0"));
+        add_item(view, IDM_WORD_WRAP, "&Word Wrap", false, false, true);
+        add_item(view, IDM_STATUS_BAR, "&Status Bar", false, false, true);
+        add_sep(view);
+        add_item(view, IDM_ZOOM_IN, "Zoom &In\tCtrl+Plus", false, false, false);
+        add_item(view, IDM_ZOOM_OUT, "Zoom &Out\tCtrl+Minus", false, false, false);
+        add_item(view, IDM_ZOOM_RESET, "&Restore Default Zoom\tCtrl+0", false, false, false);
+        add_sep(view);
+        let theme = CreatePopupMenu().unwrap_or_default();
+        add_item(theme, theme::IDM_THEME_SYSTEM, "Use &System Setting", true, false, false);
+        add_item(theme, theme::IDM_THEME_LIGHT, "&Light", true, false, false);
+        add_item(theme, theme::IDM_THEME_DARK, "&Dark", true, false, false);
+        add_submenu(view, theme, "&Theme");
 
         let help = CreatePopupMenu().unwrap_or_default();
-        let _ = AppendMenuW(bar, MF_POPUP, help.0 as usize, w!("&Help"));
-        let _ = AppendMenuW(help, MF_STRING, IDM_ABOUT as usize, w!("&About Nimble"));
+        add_item(help, IDM_CHECK_UPDATES, "Check for &Updates", false, false, false);
+        add_item(help, IDM_ABOUT, "&About Nimble", false, false, false);
 
-        bar
+        MenuSet {
+            strip: vec![
+                strip_entry("&File", file),
+                strip_entry("&Edit", edit),
+                strip_entry("&View", view),
+                strip_entry("&Help", help),
+            ],
+            popups: vec![file, edit, view, theme, help],
+            edit,
+            view,
+            theme,
+        }
     }
 }
 
@@ -289,13 +439,21 @@ unsafe extern "system" fn wnd_proc(
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(mode: ThemeMode, menus: MenuSet) -> Self {
+        let theme = if theme::effective_dark(mode) {
+            theme::dark_theme()
+        } else {
+            theme::light_theme()
+        };
         Self {
             hwnd: HWND::default(),
             tab: HWND::default(),
-            plus: HWND::default(),
             status: HWND::default(),
-            edit_menu: HMENU::default(),
+            menus,
+            menu_hot: -1,
+            menu_open: -1,
+            plus_hot: false,
+            menu_brush: HBRUSH::default(),
             docs: Vec::new(),
             active: None,
             word_wrap: true,
@@ -303,6 +461,9 @@ impl App {
             dpi: 96,
             font: HFONT::default(),
             next_id: EDIT_ID_BASE,
+            mode,
+            theme,
+            status_text: [[0; 96]; 5],
         }
     }
 
@@ -315,7 +476,11 @@ impl App {
             WINDOW_EX_STYLE(0),
             WC_TABCONTROL,
             PCWSTR::null(),
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            WINDOW_STYLE(
+                (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS).0
+                    | TCS_OWNERDRAWFIXED
+                    | TCS_FIXEDWIDTH,
+            ),
             0, 0, 0, 0,
             Some(self.hwnd),
             None,
@@ -331,20 +496,6 @@ impl App {
             self.hwnd.0 as usize,
         );
 
-        self.plus = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("BUTTON"),
-            w!("+"),
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            0, 0, 0, 0,
-            Some(self.hwnd),
-            Some(HMENU(ID_PLUS as *mut c_void)),
-            None,
-            None,
-        )
-        .unwrap_or_default();
-        sm(self.plus, WM_SETFONT, self.font.0 as usize, 1);
-
         self.status = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             STATUSCLASSNAMEW,
@@ -359,7 +510,8 @@ impl App {
         .unwrap_or_default();
         sm(self.status, WM_SETFONT, self.font.0 as usize, 1);
 
-        self.edit_menu = GetSubMenu(GetMenu(self.hwnd), 1);
+        self.measure_strip();
+        self.recompute_menu_metrics();
 
         DragAcceptFiles(self.hwnd, true);
 
@@ -370,7 +522,9 @@ impl App {
                 self.open_path(&p);
             }
         }
+        self.apply_theme();
         self.layout();
+        crate::install::update_check_async();
         }
     }
 
@@ -391,6 +545,81 @@ impl App {
                     self.on_drop(wparam);
                     LRESULT(0)
                 }
+                WM_PAINT => {
+                    let mut ps = PAINTSTRUCT::default();
+                    let hdc = BeginPaint(self.hwnd, &mut ps);
+                    self.paint_menu_strip(hdc);
+                    let _ = EndPaint(self.hwnd, &mut ps);
+                    LRESULT(0)
+                }
+                WM_MOUSEMOVE => {
+                    self.on_strip_hover(x_lparam(lparam), y_lparam(lparam));
+                    LRESULT(0)
+                }
+                WM_MOUSELEAVE => {
+                    if self.menu_hot >= 0 {
+                        self.menu_hot = -1;
+                        self.invalidate_strip();
+                    }
+                    LRESULT(0)
+                }
+                WM_LBUTTONDOWN => {
+                    if let Some(i) = self.strip_hit(x_lparam(lparam), y_lparam(lparam)) {
+                        self.menu_loop(i);
+                        LRESULT(0)
+                    } else {
+                        DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                    }
+                }
+                WM_SYSKEYDOWN => {
+                    if wparam.0 == VK_F10.0 as usize {
+                        self.menu_loop(0);
+                        LRESULT(0)
+                    } else {
+                        DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                    }
+                }
+                WM_SYSCHAR => {
+                    let ch = (wparam.0 as u32 as u8 as char).to_ascii_lowercase();
+                    if let Some(i) = self.menus.strip.iter().position(|m| m.key == ch as u16) {
+                        self.menu_loop(i);
+                        LRESULT(0)
+                    } else {
+                        DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                    }
+                }
+                WM_MEASUREITEM => {
+                    let mi = &mut *(lparam.0 as *mut MEASUREITEMSTRUCT);
+                    if mi.CtlType == ODT_MENU {
+                        self.measure_menu_item(mi);
+                    }
+                    LRESULT(1)
+                }
+                WM_DRAWITEM => {
+                    let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+                    if dis.CtlType == ODT_MENU {
+                        self.draw_menu_item(dis);
+                    } else if dis.hwndItem.0 == self.tab.0 {
+                        self.draw_tab(dis);
+                    } else if dis.hwndItem.0 == self.status.0 {
+                        self.draw_status_part(dis);
+                    }
+                    LRESULT(1)
+                }
+                WM_ERASEBKGND => {
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(self.hwnd, &mut rc);
+                    let b = CreateSolidBrush(self.theme.chrome_bg);
+                    FillRect(HDC(wparam.0 as *mut c_void), &rc, b);
+                    let _ = DeleteObject(HGDIOBJ(b.0));
+                    LRESULT(1)
+                }
+                WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+                    if self.mode == ThemeMode::System {
+                        self.apply_theme();
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                }
                 WM_SETFOCUS => {
                     if let Some(e) = self.active_edit() {
                         let _ = SetFocus(Some(e));
@@ -402,8 +631,9 @@ impl App {
                     let _ = DeleteObject(HGDIOBJ(self.font.0));
                     self.font = ui_font(self.dpi);
                     sm(self.tab, WM_SETFONT, self.font.0 as usize, 1);
-                    sm(self.plus, WM_SETFONT, self.font.0 as usize, 1);
                     sm(self.status, WM_SETFONT, self.font.0 as usize, 1);
+                    self.measure_strip();
+                    self.recompute_menu_metrics();
                     let rc = &*(lparam.0 as *const RECT);
                     let _ = SetWindowPos(
                         self.hwnd,
@@ -450,7 +680,7 @@ impl App {
                     | ES_NOHIDESEL as u32,
             );
             let Ok(edit) = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
+                WINDOW_EX_STYLE(0),
                 MSFTEDIT_CLASS,
                 PCWSTR::null(),
                 style,
@@ -473,6 +703,7 @@ impl App {
             );
             sm(edit, EM_SETTARGETDEVICE, 0, if self.word_wrap { 0 } else { 1 });
             set_editor_font(edit);
+            apply_editor_theme(edit, &self.theme);
             let _ = SetWindowSubclass(edit, Some(edit_proc), EDIT_SUBCLASS, self.hwnd.0 as usize);
             sm(edit, EM_SETMODIFY, 0, 0);
 
@@ -609,28 +840,29 @@ impl App {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
             let (cx, cy) = (rc.right, rc.bottom);
+            let menu_h = self.menu_h();
             let tab_h = scale(26, self.dpi);
-            let plus_w = scale(30, self.dpi);
+            let plus_w = tab_h; // room for the strip-drawn "+" after last tab
             let status_h = if self.show_status {
                 scale(22, self.dpi)
             } else {
                 0
             };
+            // Tabs shrink to fit like Notepad's, down to a sensible minimum.
+            let n = self.docs.len().max(1) as i32;
+            let tab_w = ((cx - plus_w) / n).clamp(scale(56, self.dpi), scale(170, self.dpi));
+            sm(
+                self.tab,
+                TCM_SETITEMSIZE,
+                0,
+                ((tab_w & 0xFFFF) | (tab_h << 16)) as isize,
+            );
             let _ = SetWindowPos(
                 self.tab,
                 None,
                 0,
-                0,
-                (cx - plus_w).max(0),
-                tab_h,
-                SWP_NOZORDER,
-            );
-            let _ = SetWindowPos(
-                self.plus,
-                None,
-                cx - plus_w,
-                0,
-                plus_w,
+                menu_h,
+                cx,
                 tab_h,
                 SWP_NOZORDER,
             );
@@ -649,13 +881,13 @@ impl App {
             } else {
                 let _ = ShowWindow(self.status, SW_HIDE);
             }
-            let edit_h = (cy - tab_h - status_h).max(0);
+            let edit_h = (cy - menu_h - tab_h - status_h).max(0);
             for d in &self.docs {
                 let _ = SetWindowPos(
                     d.edit,
                     None,
                     0,
-                    tab_h,
+                    menu_h + tab_h,
                     cx,
                     edit_h,
                     SWP_NOZORDER | SWP_NOACTIVATE,
@@ -676,32 +908,43 @@ impl App {
         sm(self.status, SB_SETPARTS, edges.len(), edges.as_ptr() as isize);
     }
 
-    fn set_status_part(&self, part: usize, text: &str) {
-        let t = wide(text);
-        sm(self.status, SB_SETTEXTW, part, t.as_ptr() as isize);
+    fn set_status_part(&mut self, part: usize, text: &str) {
+        let w = wide(text);
+        let n = (w.len() - 1).min(95);
+        self.status_text[part][..n].copy_from_slice(&w[..n]);
+        self.status_text[part][n] = 0;
+        sm(
+            self.status,
+            SB_SETTEXTW,
+            part | SBT_OWNERDRAW as usize,
+            self.status_text[part].as_ptr() as isize,
+        );
     }
 
-    fn update_status(&self) {
+    fn update_status(&mut self) {
         if !self.show_status {
             return;
         }
         let Some(i) = self.active else { return };
-        let d = &self.docs[i];
+        let (edit, zoom, enc) = {
+            let d = &self.docs[i];
+            (d.edit, d.zoom, d.encoding.label())
+        };
         let mut lo = 0i32;
         let mut hi = 0i32;
         sm(
-            d.edit,
+            edit,
             EM_GETSEL,
             &mut lo as *mut i32 as usize,
             &mut hi as *mut i32 as isize,
         );
-        let line = sm(d.edit, EM_EXLINEFROMCHAR, 0, hi as isize).0 as i64;
-        let line_start = sm(d.edit, EM_LINEINDEX, line as usize, 0).0 as i64;
+        let line = sm(edit, EM_EXLINEFROMCHAR, 0, hi as isize).0 as i64;
+        let line_start = sm(edit, EM_LINEINDEX, line as usize, 0).0 as i64;
         let col = hi as i64 - line_start;
         self.set_status_part(1, &format!("Ln {}, Col {}", line + 1, col + 1));
-        self.set_status_part(2, &format!("{}%", d.zoom));
+        self.set_status_part(2, &format!("{}%", zoom));
         self.set_status_part(3, "Windows (CRLF)");
-        self.set_status_part(4, d.encoding.label());
+        self.set_status_part(4, enc);
     }
 
     // ---- commands --------------------------------------------------------
@@ -721,7 +964,7 @@ impl App {
         }
         unsafe {
             match loword(wparam.0) {
-                IDM_NEW_TAB | ID_PLUS => self.new_document(None),
+                IDM_NEW_TAB => self.new_document(None),
                 IDM_NEW_WINDOW => self.new_window(),
                 IDM_OPEN => self.open_dialog(),
                 IDM_SAVE => {
@@ -782,8 +1025,12 @@ impl App {
                 IDM_ZOOM_IN => self.zoom(1),
                 IDM_ZOOM_OUT => self.zoom(-1),
                 IDM_ZOOM_RESET => self.zoom(0),
+                theme::IDM_THEME_SYSTEM => self.set_theme(ThemeMode::System),
+                theme::IDM_THEME_LIGHT => self.set_theme(ThemeMode::Light),
+                theme::IDM_THEME_DARK => self.set_theme(ThemeMode::Dark),
                 IDM_NEXT_TAB => self.cycle_tab(1),
                 IDM_PREV_TAB => self.cycle_tab(-1),
+                IDM_CHECK_UPDATES => self.check_updates(),
                 IDM_ABOUT => self.about(),
                 _ => return DefWindowProcW(self.hwnd, WM_COMMAND, wparam, lparam),
             }
@@ -812,7 +1059,7 @@ impl App {
 
     fn on_init_menu_popup(&mut self, wparam: WPARAM) {
         let menu = HMENU(wparam.0 as *mut c_void);
-        if menu.0 != self.edit_menu.0 {
+        if menu.0 != self.menus.edit.0 {
             return;
         }
         let Some(edit) = self.active_edit() else { return };
@@ -869,9 +1116,8 @@ impl App {
     fn toggle_wrap(&mut self) {
         self.word_wrap = !self.word_wrap;
         unsafe {
-            let menu = GetMenu(self.hwnd);
-            CheckMenuItem(
-                menu,
+            let _ = CheckMenuItem(
+                self.menus.view,
                 IDM_WORD_WRAP,
                 (MF_BYCOMMAND
                     | if self.word_wrap {
@@ -890,9 +1136,8 @@ impl App {
     fn toggle_status_bar(&mut self) {
         self.show_status = !self.show_status;
         unsafe {
-            let menu = GetMenu(self.hwnd);
-            CheckMenuItem(
-                menu,
+            let _ = CheckMenuItem(
+                self.menus.view,
                 IDM_STATUS_BAR,
                 (MF_BYCOMMAND
                     | if self.show_status {
@@ -919,6 +1164,40 @@ impl App {
         self.update_status();
     }
 
+    fn check_updates(&self) {
+        unsafe {
+            if !crate::install::is_installed() {
+                MessageBoxW(
+                    Some(self.hwnd),
+                    w!("Nimble is not installed. Run \"nimble.exe --install\" to install it and enable updates."),
+                    w!("Nimble"),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+                return;
+            }
+            match crate::install::check_updates() {
+                Some(2) => MessageBoxW(
+                    Some(self.hwnd),
+                    w!("Nimble was updated. Restart Nimble to use the new version."),
+                    w!("Nimble"),
+                    MB_OK | MB_ICONINFORMATION,
+                ),
+                Some(0) => MessageBoxW(
+                    Some(self.hwnd),
+                    w!("Nimble is up to date."),
+                    w!("Nimble"),
+                    MB_OK | MB_ICONINFORMATION,
+                ),
+                _ => MessageBoxW(
+                    Some(self.hwnd),
+                    w!("Couldn't check for updates. Try again later."),
+                    w!("Nimble"),
+                    MB_OK | MB_ICONWARNING,
+                ),
+            };
+        }
+    }
+
     fn about(&self) {
         unsafe {
             MessageBoxW(
@@ -927,6 +1206,433 @@ impl App {
                 w!("About Nimble"),
                 MB_OK | MB_ICONINFORMATION,
             );
+        }
+    }
+
+    // ---- theme -------------------------------------------------------------
+
+    fn set_theme(&mut self, mode: ThemeMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        theme::save_mode(mode);
+        self.apply_theme();
+    }
+
+    fn apply_theme(&mut self) {
+        let dark = theme::effective_dark(self.mode);
+        self.theme = if dark {
+            theme::dark_theme()
+        } else {
+            theme::light_theme()
+        };
+        theme::set_preferred_app_mode(dark);
+        theme::set_titlebar_dark(self.hwnd, dark);
+        for d in &self.docs {
+            apply_editor_theme(d.edit, &self.theme);
+        }
+        theme::set_control_dark(self.tab, dark);
+        theme::set_control_dark(self.status, dark);
+        sm(self.status, SB_SETBKCOLOR, 0, self.theme.chrome_bg.0 as isize);
+        unsafe {
+            let _ = CheckMenuRadioItem(
+                self.menus.theme,
+                theme::IDM_THEME_SYSTEM,
+                theme::IDM_THEME_DARK,
+                self.mode.command_id(),
+                MF_BYCOMMAND.0,
+            );
+            // Popup edge/background pixels outside item rects use this brush.
+            let brush = CreateSolidBrush(self.theme.menu_bg);
+            let info = MENUINFO {
+                cbSize: size_of::<MENUINFO>() as u32,
+                fMask: MIM_BACKGROUND,
+                hbrBack: brush,
+                ..Default::default()
+            };
+            for &m in &self.menus.popups {
+                let _ = SetMenuInfo(m, &info);
+            }
+            if !self.menu_brush.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.menu_brush.0));
+            }
+            self.menu_brush = brush;
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+            );
+        }
+    }
+
+    fn draw_tab(&self, dis: &DRAWITEMSTRUCT) {
+        unsafe {
+            let i = dis.itemID as usize;
+            if i >= self.docs.len() {
+                return;
+            }
+            let th = self.theme;
+            let selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+            let bg = if selected { th.tab_sel } else { th.chrome_bg };
+            let fg = if selected { th.tab_fg } else { th.tab_dim };
+            let brush = CreateSolidBrush(bg);
+            FillRect(dis.hDC, &dis.rcItem, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+            if selected {
+                let mut bar = dis.rcItem;
+                bar.bottom = bar.top + scale(2, self.dpi).max(1);
+                let accent = CreateSolidBrush(th.accent);
+                FillRect(dis.hDC, &bar, accent);
+                let _ = DeleteObject(HGDIOBJ(accent.0));
+            }
+            let mut label = wide(&self.tab_label(i));
+            let n = label.len().saturating_sub(1);
+            let old = SelectObject(dis.hDC, HGDIOBJ(self.font.0));
+            SetBkMode(dis.hDC, TRANSPARENT);
+            SetTextColor(dis.hDC, fg);
+            let mut rc = dis.rcItem;
+            rc.left += scale(8, self.dpi);
+            rc.right -= scale(8, self.dpi);
+            DrawTextW(
+                dis.hDC,
+                &mut label[..n],
+                &mut rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            SelectObject(dis.hDC, old);
+        }
+    }
+
+    fn draw_status_part(&self, dis: &DRAWITEMSTRUCT) {
+        unsafe {
+            if dis.itemData == 0 {
+                return;
+            }
+            let bg = CreateSolidBrush(self.theme.chrome_bg);
+            FillRect(dis.hDC, &dis.rcItem, bg);
+            let _ = DeleteObject(HGDIOBJ(bg.0));
+            let ptr = dis.itemData as *const u16;
+            let mut len = 0usize;
+            while len < 96 && *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let mut s = std::slice::from_raw_parts(ptr, len).to_vec();
+            let old = SelectObject(dis.hDC, HGDIOBJ(self.font.0));
+            SetBkMode(dis.hDC, TRANSPARENT);
+            SetTextColor(dis.hDC, self.theme.status_fg);
+            let mut rc = dis.rcItem;
+            DrawTextW(
+                dis.hDC,
+                &mut s,
+                &mut rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            SelectObject(dis.hDC, old);
+        }
+    }
+
+    // ---- menu strip ---------------------------------------------------------
+    // The menu bar is drawn by hand: Win32 menu bars can't be themed, so the
+    // window has no attached menu. The strip paints File/Edit/View/Help across
+    // the top of the client area; clicking opens the real popup via
+    // TrackPopupMenuEx, and every popup item is owner-drawn (ODT_MENU).
+
+    fn menu_h(&self) -> i32 {
+        scale(26, self.dpi)
+    }
+
+    fn measure_strip(&mut self) {
+        unsafe {
+            let hdc = GetDC(Some(self.hwnd));
+            let old = SelectObject(hdc, HGDIOBJ(self.font.0));
+            let mut x = scale(2, self.dpi);
+            for e in &mut self.menus.strip {
+                e.x = x;
+                e.w = text_extent(hdc, &e.label) + 2 * scale(11, self.dpi);
+                x += e.w;
+            }
+            SelectObject(hdc, old);
+            let _ = ReleaseDC(Some(self.hwnd), hdc);
+        }
+    }
+
+    /// Recomputes the accelerator column width for every popup so the
+    /// shortcut text aligns down the right side of each menu.
+    fn recompute_menu_metrics(&self) {
+        unsafe {
+            let hdc = GetDC(Some(self.hwnd));
+            let old = SelectObject(hdc, HGDIOBJ(self.font.0));
+            for &m in &self.menus.popups {
+                let n = GetMenuItemCount(Some(m));
+                if n < 0 {
+                    continue;
+                }
+                let mut max_w = 0;
+                for i in 0..n as u32 {
+                    if let Some(d) = menu_item_data(m, i) {
+                        let w = text_extent(hdc, &(*d).accel);
+                        max_w = max_w.max(w);
+                    }
+                }
+                for i in 0..n as u32 {
+                    if let Some(d) = menu_item_data(m, i) {
+                        (*d).accel_col = max_w;
+                    }
+                }
+            }
+            SelectObject(hdc, old);
+            let _ = ReleaseDC(Some(self.hwnd), hdc);
+        }
+    }
+
+    fn strip_hit(&self, x: i32, y: i32) -> Option<usize> {
+        if y < 0 || y >= self.menu_h() {
+            return None;
+        }
+        self.menus
+            .strip
+            .iter()
+            .position(|e| x >= e.x && x < e.x + e.w)
+    }
+
+    fn invalidate_strip(&self) {
+        unsafe {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut rc);
+            rc.bottom = self.menu_h();
+            let _ = InvalidateRect(Some(self.hwnd), Some(&rc), false);
+        }
+    }
+
+    fn on_strip_hover(&mut self, x: i32, y: i32) {
+        let hit = self.strip_hit(x, y).map(|i| i as i32).unwrap_or(-1);
+        if hit != self.menu_hot {
+            self.menu_hot = hit;
+            self.invalidate_strip();
+        }
+        if hit >= 0 {
+            unsafe {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: self.hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            }
+        }
+    }
+
+    /// Shows the popup for strip item `idx`; while open, clicking a different
+    /// strip entry chains into that menu like a classic menu bar.
+    fn menu_loop(&mut self, mut idx: usize) {
+        unsafe {
+            loop {
+                self.menu_open = idx as i32;
+                self.menu_hot = idx as i32;
+                self.invalidate_strip();
+                let e = &self.menus.strip[idx];
+                let cmd = TrackPopupMenuEx(
+                    e.menu,
+                    (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
+                    e.x,
+                    self.menu_h(),
+                    self.hwnd,
+                    None,
+                )
+                .0;
+                self.menu_open = -1;
+                self.invalidate_strip();
+                if cmd != 0 {
+                    self.on_command(WPARAM(cmd as usize), LPARAM(0));
+                    break;
+                }
+                // Dismissed: only chain when the cursor landed on a
+                // different strip item (i.e. the click that closed us).
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let _ = ScreenToClient(self.hwnd, &mut p);
+                match self.strip_hit(p.x, p.y) {
+                    Some(n) if n != idx => idx = n,
+                    _ => break,
+                }
+            }
+            if let Some(e) = self.active_edit() {
+                let _ = SetFocus(Some(e));
+            }
+        }
+    }
+
+    fn paint_menu_strip(&self, hdc: HDC) {
+        unsafe {
+            let menu_h = self.menu_h();
+            let old = SelectObject(hdc, HGDIOBJ(self.font.0));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, self.theme.menu_fg);
+            for (i, e) in self.menus.strip.iter().enumerate() {
+                let mut rc = RECT {
+                    left: e.x,
+                    top: 0,
+                    right: e.x + e.w,
+                    bottom: menu_h,
+                };
+                if i as i32 == self.menu_hot || i as i32 == self.menu_open {
+                    let b = CreateSolidBrush(self.theme.menu_hover);
+                    FillRect(hdc, &rc, b);
+                    let _ = DeleteObject(HGDIOBJ(b.0));
+                }
+                let mut label = e.label.clone();
+                let n = label.len().saturating_sub(1);
+                DrawTextW(hdc, &mut label[..n], &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            SelectObject(hdc, old);
+        }
+    }
+
+    fn measure_menu_item(&self, mi: &mut MEASUREITEMSTRUCT) {
+        unsafe {
+            let d = mi.itemData as *const MenuItemData;
+            if d.is_null() || (*d).sep {
+                mi.itemWidth = 1;
+                mi.itemHeight = scale(9, self.dpi) as u32;
+                return;
+            }
+            let hdc = GetDC(Some(self.hwnd));
+            let old = SelectObject(hdc, HGDIOBJ(self.font.0));
+            let label_w = text_extent(hdc, &(*d).label);
+            let text_h = text_height(hdc, &(*d).label);
+            SelectObject(hdc, old);
+            let _ = ReleaseDC(Some(self.hwnd), hdc);
+            let gutter = scale(26, self.dpi);
+            let accel_w = (*d).accel_col;
+            let gap = if accel_w > 0 { scale(18, self.dpi) } else { 0 };
+            let tail = if (*d).submenu { scale(22, self.dpi) } else { scale(12, self.dpi) };
+            mi.itemWidth = (gutter + label_w + gap + accel_w + tail) as u32;
+            mi.itemHeight = (text_h + scale(9, self.dpi)).max(scale(22, self.dpi)) as u32;
+        }
+    }
+
+    fn draw_menu_item(&self, dis: &DRAWITEMSTRUCT) {
+        unsafe {
+            let th = self.theme;
+            let d = dis.itemData as *const MenuItemData;
+            let bg = CreateSolidBrush(th.menu_bg);
+            FillRect(dis.hDC, &dis.rcItem, bg);
+            let _ = DeleteObject(HGDIOBJ(bg.0));
+            if d.is_null() || (*d).sep {
+                // Separator: a single hairline, inset past the check gutter.
+                let mut ln = dis.rcItem;
+                ln.left += scale(26, self.dpi);
+                ln.right -= scale(8, self.dpi);
+                ln.top = (ln.top + ln.bottom) / 2;
+                ln.bottom = ln.top + 1;
+                let b = CreateSolidBrush(th.menu_sep);
+                FillRect(dis.hDC, &ln, b);
+                let _ = DeleteObject(HGDIOBJ(b.0));
+                return;
+            }
+            let d = &*d;
+            let selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+            let grayed = (dis.itemState.0 & (ODS_GRAYED.0 | ODS_DISABLED.0)) != 0;
+            if selected && !grayed {
+                let b = CreateSolidBrush(th.menu_hover);
+                FillRect(dis.hDC, &dis.rcItem, b);
+                let _ = DeleteObject(HGDIOBJ(b.0));
+            }
+            let fg = if grayed { th.menu_dim } else { th.menu_fg };
+            let old = SelectObject(dis.hDC, HGDIOBJ(self.font.0));
+            SetBkMode(dis.hDC, TRANSPARENT);
+            SetTextColor(dis.hDC, fg);
+            let gutter = scale(26, self.dpi);
+            // Check gutter: tick, or a radio dot for mutually-exclusive items.
+            if (dis.itemState.0 & ODS_CHECKED.0) != 0 {
+                let glyph: Vec<u16> = if d.radio {
+                    "\u{25CF}".encode_utf16().collect()
+                } else {
+                    "\u{2713}".encode_utf16().collect()
+                };
+                let mut rc = RECT {
+                    left: dis.rcItem.left + scale(2, self.dpi),
+                    top: dis.rcItem.top,
+                    right: dis.rcItem.left + gutter,
+                    bottom: dis.rcItem.bottom,
+                };
+                let mut g = glyph.clone();
+                DrawTextW(dis.hDC, &mut g, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            let mut rc = dis.rcItem;
+            rc.left += gutter;
+            rc.right -= if d.submenu { scale(22, self.dpi) } else { scale(12, self.dpi) };
+            if d.accel.len() > 1 {
+                rc.right -= d.accel_col + scale(18, self.dpi);
+            }
+            let mut label = d.label.clone();
+            let n = label.len().saturating_sub(1);
+            DrawTextW(dis.hDC, &mut label[..n], &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            // Accelerator / submenu arrow share the right edge.
+            let mut rrc = dis.rcItem;
+            rrc.right -= scale(12, self.dpi);
+            SetTextColor(dis.hDC, th.menu_dim);
+            if d.submenu {
+                let mut arrow: Vec<u16> = "\u{203A}".encode_utf16().collect();
+                DrawTextW(dis.hDC, &mut arrow, &mut rrc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            } else if d.accel.len() > 1 {
+                let mut accel = d.accel.clone();
+                let n = accel.len().saturating_sub(1);
+                DrawTextW(
+                    dis.hDC,
+                    &mut accel[..n],
+                    &mut rrc,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+            SelectObject(dis.hDC, old);
+        }
+    }
+
+    /// The "+" new-tab glyph sits right after the last tab, drawn inside the
+    /// strip's empty area — same hit-test region used by tab_proc's clicks.
+    fn plus_rect(&self) -> RECT {
+        let side = scale(20, self.dpi);
+        let top = (scale(26, self.dpi) - side) / 2;
+        let count = sm(self.tab, TCM_GETITEMCOUNT, 0, 0).0.max(0);
+        let mut left = scale(4, self.dpi);
+        if count > 0 {
+            let mut ir = RECT::default();
+            sm(
+                self.tab,
+                TCM_GETITEMRECT,
+                (count - 1) as usize,
+                &mut ir as *mut RECT as isize,
+            );
+            left = ir.right + scale(3, self.dpi);
+        }
+        RECT {
+            left,
+            top,
+            right: left + side,
+            bottom: top + side,
+        }
+    }
+
+    fn draw_plus(&self, hdc: HDC) {
+        unsafe {
+            let rc = self.plus_rect();
+            if self.plus_hot {
+                let b = CreateSolidBrush(self.theme.menu_hover);
+                FillRect(hdc, &rc, b);
+                let _ = DeleteObject(HGDIOBJ(b.0));
+            }
+            let old = SelectObject(hdc, HGDIOBJ(self.font.0));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, self.theme.tab_fg);
+            let mut rc2 = rc;
+            let mut t = wide("+");
+            let n = t.len() - 1;
+            DrawTextW(hdc, &mut t[..n], &mut rc2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdc, old);
         }
     }
 
@@ -1028,6 +1734,40 @@ impl App {
 
 // ---- helpers --------------------------------------------------------------
 
+/// Text metrics for a null-terminated UTF-16 buffer.
+fn text_size(hdc: HDC, s: &[u16]) -> SIZE {
+    let n = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+    let mut sz = SIZE::default();
+    unsafe {
+        let _ = GetTextExtentPoint32W(hdc, &s[..n], &mut sz);
+    }
+    sz
+}
+
+fn text_extent(hdc: HDC, s: &[u16]) -> i32 {
+    text_size(hdc, s).cx
+}
+
+fn text_height(hdc: HDC, s: &[u16]) -> i32 {
+    text_size(hdc, s).cy
+}
+
+/// Fetches the owner-draw data pointer of the menu item at `pos`.
+unsafe fn menu_item_data(menu: HMENU, pos: u32) -> Option<*mut MenuItemData> {
+    let mut mii = MENUITEMINFOW {
+        cbSize: size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_DATA,
+        ..Default::default()
+    };
+    unsafe {
+        if GetMenuItemInfoW(menu, pos, true, &mut mii).is_ok() && mii.dwItemData != 0 {
+            Some(mii.dwItemData as *mut MenuItemData)
+        } else {
+            None
+        }
+    }
+}
+
 fn ui_font(dpi: u32) -> HFONT {
     unsafe {
         CreateFontW(
@@ -1058,6 +1798,23 @@ fn set_editor_font(edit: HWND) {
     let face = wide("Consolas");
     cf.Base.szFaceName[..8].copy_from_slice(&face[..8]);
     sm(edit, EM_SETCHARFORMAT, SCF_ALL as usize, &cf as *const _ as isize);
+}
+
+/// Recolors an editor control for the active theme. Preserves the modified
+/// flag and silences EN_CHANGE while formatting so the transient dirty state
+/// can't reach the tab label or title bar.
+fn apply_editor_theme(edit: HWND, th: &Theme) {
+    let was_modified = sm(edit, EM_GETMODIFY, 0, 0).0;
+    sm(edit, EM_SETEVENTMASK, 0, 0);
+    sm(edit, EM_SETBKGNDCOLOR, 0, th.edit_bg.0 as isize);
+    let mut cf = CHARFORMAT2W::default();
+    cf.Base.cbSize = size_of::<CHARFORMAT2W>() as u32;
+    cf.Base.dwMask = CFM_COLOR;
+    cf.Base.crTextColor = th.edit_fg;
+    sm(edit, EM_SETCHARFORMAT, SCF_ALL as usize, &cf as *const _ as isize);
+    sm(edit, EM_SETMODIFY, was_modified as usize, 0);
+    sm(edit, EM_SETEVENTMASK, 0, (ENM_CHANGE | ENM_SELCHANGE) as isize);
+    theme::set_control_dark(edit, th.dark);
 }
 
 fn load_file(edit: HWND, path: &Path) -> std::io::Result<Encoding> {
@@ -1165,6 +1922,99 @@ unsafe extern "system" fn tab_proc(
 ) -> LRESULT {
     unsafe {
     match msg {
+        // Fill the strip background in the theme color; the control's own
+        // erase would otherwise paint the default face color.
+        WM_ERASEBKGND => {
+            let parent = HWND(refdata as *mut c_void);
+            let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
+            if app.is_null() {
+                return DefSubclassProc(hwnd, msg, wparam, lparam);
+            }
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let b = CreateSolidBrush((*app).theme.chrome_bg);
+            FillRect(HDC(wparam.0 as *mut c_void), &rc, b);
+            let _ = DeleteObject(HGDIOBJ(b.0));
+            LRESULT(1)
+        }
+        WM_PAINT => {
+            let r = DefSubclassProc(hwnd, msg, wparam, lparam);
+            let parent = HWND(refdata as *mut c_void);
+            let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
+            if !app.is_null() {
+                let a = &*app;
+                let hdc = GetDC(Some(hwnd));
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let b = CreateSolidBrush(a.theme.chrome_bg);
+                // Empty strip to the right of the last tab
+                let count = sm(hwnd, TCM_GETITEMCOUNT, 0, 0).0 as i32;
+                if count > 0 {
+                    let mut ir = RECT::default();
+                    sm(hwnd, TCM_GETITEMRECT, (count - 1) as usize, &mut ir as *mut RECT as isize);
+                    if ir.right < rc.right {
+                        let mut gap = rc;
+                        gap.left = ir.right;
+                        FillRect(hdc, &gap, b);
+                    }
+                }
+                // Cover the default 3D edge under the tabs so the selected
+                // tab visually merges into the editor.
+                let mut edge = rc;
+                edge.top = edge.bottom - scale(2, a.dpi).max(1);
+                FillRect(hdc, &edge, b);
+                let _ = DeleteObject(HGDIOBJ(b.0));
+                a.draw_plus(hdc);
+                let _ = ReleaseDC(Some(hwnd), hdc);
+            }
+            r
+        }
+        WM_MOUSEMOVE => {
+            let parent = HWND(refdata as *mut c_void);
+            let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
+            if !app.is_null() {
+                let a = &mut *app;
+                let hot = a.plus_hot;
+                let now = pt_in_rect(&a.plus_rect(), x_lparam(lparam), y_lparam(lparam));
+                if now != hot {
+                    a.plus_hot = now;
+                    let rc = a.plus_rect();
+                    let _ = InvalidateRect(Some(hwnd), Some(&rc), false);
+                }
+                if now {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                }
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            let parent = HWND(refdata as *mut c_void);
+            let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
+            if !app.is_null() && (*app).plus_hot {
+                (*app).plus_hot = false;
+                let rc = (*app).plus_rect();
+                let _ = InvalidateRect(Some(hwnd), Some(&rc), false);
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONUP => {
+            let parent = HWND(refdata as *mut c_void);
+            let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
+            if !app.is_null() {
+                let a = &*app;
+                if pt_in_rect(&a.plus_rect(), x_lparam(lparam), y_lparam(lparam)) {
+                    (*app).new_document(None);
+                    return LRESULT(0);
+                }
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
         WM_MBUTTONUP | WM_LBUTTONDBLCLK => {
             let r = DefSubclassProc(hwnd, msg, wparam, lparam);
             let parent = HWND(refdata as *mut c_void);

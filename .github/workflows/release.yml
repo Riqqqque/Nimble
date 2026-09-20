@@ -19,12 +19,14 @@ jobs:
         run: cargo build --release --locked
       - name: Package
         run: |
+          Copy-Item target/release/nimble.exe nimble.exe
           Copy-Item target/release/nimble.exe nimble-x86_64-windows.exe
           Compress-Archive nimble-x86_64-windows.exe nimble-x86_64-windows.zip
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            nimble.exe
             nimble-x86_64-windows.exe
             nimble-x86_64-windows.zip
           generate_release_notes: true
