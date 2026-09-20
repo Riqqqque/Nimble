@@ -1,0 +1,30 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          Copy-Item target/release/nimble.exe nimble-x86_64-windows.exe
+          Compress-Archive nimble-x86_64-windows.exe nimble-x86_64-windows.zip
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nimble-x86_64-windows.exe
+            nimble-x86_64-windows.zip
+          generate_release_notes: true
