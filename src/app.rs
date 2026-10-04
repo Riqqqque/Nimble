@@ -1123,6 +1123,7 @@ impl App {
                     let _ = KillTimer(Some(self.hwnd), code::TIMER_CHECK);
                     if let Some(i) = self.active {
                         self.check(i);
+                        self.repaint_code(i);
                     }
                     LRESULT(0)
                 }

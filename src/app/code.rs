@@ -632,6 +632,17 @@ impl App {
         }
     }
 
+    /// Repaints the whole colored window from scratch. Runs once typing
+    /// pauses: edits RichEdit makes on its own (Alt+Backspace undo, drag
+    /// and drop, IME) can't be pinned to an offset, and this bounds any
+    /// color drift they cause to a moment.
+    pub(super) fn repaint_code(&mut self, i: usize) {
+        if self.docs[i].painted.is_some() && !self.edit_pending(i) {
+            self.docs[i].styles.clear();
+            self.decorate(i);
+        }
+    }
+
     /// Recompute caret-driven highlights and repaint where they changed.
     pub(super) fn update_overlays(&mut self) {
         let Some(i) = self.active else { return };
