@@ -20,7 +20,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::document::Document;
+use crate::draw::{self, Aa};
 use crate::encoding::{self, Encoding};
+use crate::findbar::{self, BarMode};
+use crate::settings::{self, Action, Bind, MOD_CTRL, MOD_SHIFT};
 use crate::theme::{self, Theme, ThemeMode};
 
 const WND_CLASS: PCWSTR = w!("NimbleWindow");
@@ -35,6 +38,7 @@ const IDM_SAVE: u32 = 103;
 const IDM_SAVE_AS: u32 = 104;
 const IDM_CLOSE_TAB: u32 = 105;
 const IDM_EXIT: u32 = 106;
+const IDM_SETTINGS: u32 = 107;
 const IDM_UNDO: u32 = 200;
 const IDM_REDO: u32 = 201;
 const IDM_CUT: u32 = 202;
@@ -42,38 +46,80 @@ const IDM_COPY: u32 = 203;
 const IDM_PASTE: u32 = 204;
 const IDM_DELETE: u32 = 205;
 const IDM_SELECT_ALL: u32 = 206;
+const IDM_FIND: u32 = 207;
+const IDM_REPLACE: u32 = 208;
+const IDM_GOTO: u32 = 209;
+const IDM_FIND_NEXT: u32 = 210;
+const IDM_FIND_PREV: u32 = 211;
+const IDM_DUP_LINE: u32 = 212;
 const IDM_WORD_WRAP: u32 = 300;
 const IDM_STATUS_BAR: u32 = 301;
 const IDM_ZOOM_IN: u32 = 302;
 const IDM_ZOOM_OUT: u32 = 303;
 const IDM_ZOOM_RESET: u32 = 304;
+const IDM_LINE_NUMBERS: u32 = 308;
 const IDM_ABOUT: u32 = 400;
 const IDM_CHECK_UPDATES: u32 = 401;
 // Theme submenu IDs live in theme.rs (IDM_THEME_SYSTEM/LIGHT/DARK)
 const IDM_NEXT_TAB: u32 = 500;
 const IDM_PREV_TAB: u32 = 501;
 
+/// Every command that can be rebound in Settings, in display order.
+pub(crate) const ACTIONS: &[Action] = &[
+    Action { cmd: IDM_NEW_TAB, name: "New tab", def: Some(Bind::new(MOD_CTRL, 'T' as u16)) },
+    Action { cmd: IDM_NEW_WINDOW, name: "New window", def: Some(Bind::new(MOD_CTRL, 'N' as u16)) },
+    Action { cmd: IDM_OPEN, name: "Open…", def: Some(Bind::new(MOD_CTRL, 'O' as u16)) },
+    Action { cmd: IDM_SAVE, name: "Save", def: Some(Bind::new(MOD_CTRL, 'S' as u16)) },
+    Action { cmd: IDM_SAVE_AS, name: "Save as…", def: Some(Bind::new(MOD_CTRL | MOD_SHIFT, 'S' as u16)) },
+    Action { cmd: IDM_CLOSE_TAB, name: "Close tab", def: Some(Bind::new(MOD_CTRL, 'W' as u16)) },
+    Action { cmd: IDM_UNDO, name: "Undo", def: Some(Bind::new(MOD_CTRL, 'Z' as u16)) },
+    Action { cmd: IDM_REDO, name: "Redo", def: Some(Bind::new(MOD_CTRL, 'Y' as u16)) },
+    Action { cmd: IDM_CUT, name: "Cut", def: Some(Bind::new(MOD_CTRL, 'X' as u16)) },
+    Action { cmd: IDM_COPY, name: "Copy", def: Some(Bind::new(MOD_CTRL, 'C' as u16)) },
+    Action { cmd: IDM_PASTE, name: "Paste", def: Some(Bind::new(MOD_CTRL, 'V' as u16)) },
+    Action { cmd: IDM_DELETE, name: "Delete", def: Some(Bind::new(0, VK_DELETE.0)) },
+    Action { cmd: IDM_SELECT_ALL, name: "Select all", def: Some(Bind::new(MOD_CTRL, 'A' as u16)) },
+    Action { cmd: IDM_DUP_LINE, name: "Duplicate line", def: Some(Bind::new(MOD_CTRL, 'D' as u16)) },
+    Action { cmd: IDM_FIND, name: "Find…", def: Some(Bind::new(MOD_CTRL, 'F' as u16)) },
+    Action { cmd: IDM_REPLACE, name: "Replace…", def: Some(Bind::new(MOD_CTRL, 'H' as u16)) },
+    Action { cmd: IDM_GOTO, name: "Go to line…", def: Some(Bind::new(MOD_CTRL, 'G' as u16)) },
+    Action { cmd: IDM_FIND_NEXT, name: "Find next", def: Some(Bind::new(0, VK_F3.0)) },
+    Action { cmd: IDM_FIND_PREV, name: "Find previous", def: Some(Bind::new(MOD_SHIFT, VK_F3.0)) },
+    Action { cmd: IDM_ZOOM_IN, name: "Zoom in", def: Some(Bind::new(MOD_CTRL, VK_OEM_PLUS.0)) },
+    Action { cmd: IDM_ZOOM_OUT, name: "Zoom out", def: Some(Bind::new(MOD_CTRL, VK_OEM_MINUS.0)) },
+    Action { cmd: IDM_ZOOM_RESET, name: "Reset zoom", def: Some(Bind::new(MOD_CTRL, '0' as u16)) },
+    Action { cmd: IDM_NEXT_TAB, name: "Next tab", def: Some(Bind::new(MOD_CTRL, VK_TAB.0)) },
+    Action { cmd: IDM_PREV_TAB, name: "Previous tab", def: Some(Bind::new(MOD_CTRL | MOD_SHIFT, VK_TAB.0)) },
+    Action { cmd: IDM_WORD_WRAP, name: "Toggle word wrap", def: None },
+    Action { cmd: IDM_LINE_NUMBERS, name: "Toggle line numbers", def: None },
+    Action { cmd: IDM_STATUS_BAR, name: "Toggle status bar", def: None },
+    Action { cmd: IDM_SETTINGS, name: "Open settings", def: Some(Bind::new(MOD_CTRL, VK_OEM_COMMA.0)) },
+];
+
 const EDIT_ID_BASE: usize = 4096;
-const TAB_SUBCLASS: usize = 1;
+/// Notifications every editor sends: dirty state, caret moves, scrolling.
+const EDIT_EVENTS: u32 = ENM_CHANGE | ENM_SELCHANGE | ENM_SCROLL;
 const EDIT_SUBCLASS: usize = 2;
-const STATUS_SUBCLASS: usize = 3;
 const POPUP_SUBCLASS: usize = 4;
+
+/// The live accelerator table — rebuilt when shortcuts change.
+static ACCEL: AtomicUsize = AtomicUsize::new(0);
 
 /// Our window handle while a menu popup is being hooked (same thread only).
 static POPUP_HOOK_HWND: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
-fn sm(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
+pub(crate) fn sm(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
     unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(LPARAM(lparam))) }
 }
 
 #[inline]
-fn loword(v: usize) -> u32 {
+pub(crate) fn loword(v: usize) -> u32 {
     (v & 0xFFFF) as u32
 }
 
 #[inline]
-fn hiword(v: usize) -> u32 {
+pub(crate) fn hiword(v: usize) -> u32 {
     ((v >> 16) & 0xFFFF) as u32
 }
 
@@ -87,17 +133,17 @@ fn y_lparam(l: LPARAM) -> i32 {
     ((l.0 >> 16) as i16) as i32
 }
 
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[inline]
-fn scale(v: i32, dpi: u32) -> i32 {
+pub(crate) fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
 }
 
 #[inline]
-fn pt_in_rect(rc: &RECT, x: i32, y: i32) -> bool {
+pub(crate) fn pt_in_rect(rc: &RECT, x: i32, y: i32) -> bool {
     x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
 }
 
@@ -108,6 +154,7 @@ struct MenuItemData {
     accel: Vec<u16>, // shortcut text ("Ctrl+S") or empty
     accel_col: i32,  // shared accelerator column width for its popup
     label_col: i32,  // shared label column width for its popup
+    cmd: u32,        // command id — used to re-label when shortcuts change
     sep: bool,
     radio: bool,
     submenu: bool,
@@ -132,29 +179,39 @@ struct MenuSet {
     theme: HMENU,
 }
 
-struct App {
-    hwnd: HWND,
-    tab: HWND,
-    status: HWND,
+pub(crate) struct App {
+    pub(crate) hwnd: HWND,
     menus: MenuSet,
     menu_hot: i32,  // strip index under the cursor, -1 = none
     menu_open: i32, // strip index whose popup is showing, -1 = none
     plus_hot: bool, // cursor over the "+" new-tab glyph
     tab_hot: i32,   // tab index under the cursor, -1 = none
     close_hot: i32, // tab index whose close button is hot, -1 = none
+    close_press: i32, // tab index whose close button is pressed
     menu_brush: HBRUSH,
-    docs: Vec<Document>,
-    active: Option<usize>,
-    word_wrap: bool,
-    show_status: bool,
-    dpi: u32,
-    font: HFONT,
+    pub(crate) docs: Vec<Document>,
+    pub(crate) active: Option<usize>,
+    pub(crate) word_wrap: bool,
+    pub(crate) show_status: bool,
+    pub(crate) line_numbers: bool,
+    pub(crate) auto_indent: bool,
+    pub(crate) edit_pt: i32,
+    pub(crate) dpi: u32,
+    pub(crate) font: HFONT,
     ui_face: String,
-    edit_face: String,
+    pub(crate) edit_face: String,
     next_id: usize,
-    mode: ThemeMode,
-    theme: Theme,
-    status_text: [[u16; 96]; 5],
+    pub(crate) mode: ThemeMode,
+    pub(crate) theme: Theme,
+    /// Status band segments, right to left: encoding, line endings, zoom,
+    /// caret position.
+    status_text: [String; 4],
+    tab_w: i32,    // cell width, set by layout()
+    gutter_w: i32, // line-number gutter width, 0 when off
+    pub(crate) binds: Vec<Option<Bind>>,
+    pub(crate) findbar: HWND,
+    pub(crate) find_query: Vec<u16>,
+    pub(crate) settings_hwnd: HWND,
 }
 
 pub fn run() {
@@ -204,9 +261,15 @@ pub fn run() {
         }
 
         let menus = build_menu();
-        let accel = create_accel();
+        findbar::register(hinst);
+        draw::init();
 
-        let app = Box::new(App::new(mode, menus));
+        let prefs = settings::load_prefs();
+        let binds = settings::load_binds(ACTIONS);
+        let accel = settings::build_accel(ACTIONS, &binds);
+        ACCEL.store(accel.0 as usize, Ordering::Relaxed);
+
+        let app = Box::new(App::new(mode, menus, binds, prefs));
         let app_ptr = Box::into_raw(app);
 
         let sdpi = GetDpiForSystem();
@@ -234,12 +297,37 @@ pub fn run() {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if TranslateAcceleratorW(hwnd, accel, &msg) == 0 {
+            // Shortcuts belong to the main window only — the Settings window
+            // must see raw keys while it records a new binding.
+            let ours = !msg.hwnd.0.is_null() && GetAncestor(msg.hwnd, GA_ROOT).0 == hwnd.0;
+            // Inside a find-bar field, text-editing keys (Ctrl+C/V/X/Z/A,
+            // Delete) edit the field, not the document. Other shortcuts
+            // (Ctrl+H, F3, ...) still work.
+            let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+            let in_bar = !app.is_null()
+                && !(*app).findbar.0.is_null()
+                && GetParent(msg.hwnd).is_ok_and(|p| p.0 == (*app).findbar.0);
+            let skip = !ours || (in_bar && is_field_edit_key(&msg));
+            let a = ACCEL.load(Ordering::Relaxed);
+            if skip || a == 0 || TranslateAcceleratorW(hwnd, HACCEL(a as *mut c_void), &msg) == 0
+            {
                 let _ = TranslateMessage(&msg);
                 let _ = DispatchMessageW(&msg);
             }
         }
     }
+}
+
+/// Keys a single-line text field handles itself.
+fn is_field_edit_key(msg: &MSG) -> bool {
+    if msg.message != WM_KEYDOWN {
+        return false;
+    }
+    let vk = msg.wParam.0 as u16;
+    let ctrl = unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 };
+    vk == VK_DELETE.0
+        || vk == VK_BACK.0
+        || (ctrl && [b'A', b'C', b'V', b'X', b'Z', b'Y'].contains(&(vk as u8)) && vk < 0x80)
 }
 
 /// Splits "Te&xt\tAccel" into (display label, accelerator text).
@@ -257,6 +345,7 @@ fn add_item(menu: HMENU, id: u32, text: &str, radio: bool, submenu: bool, checke
         accel: wide(&accel),
         accel_col: 0,
         label_col: 0,
+        cmd: id,
         sep: false,
         radio,
         submenu,
@@ -277,6 +366,7 @@ fn add_sep(menu: HMENU) {
         accel: Vec::new(),
         accel_col: 0,
         label_col: 0,
+        cmd: 0,
         sep: true,
         radio: false,
         submenu: false,
@@ -300,6 +390,7 @@ fn add_submenu(menu: HMENU, sub: HMENU, text: &str) {
         accel: Vec::new(),
         accel_col: 0,
         label_col: 0,
+        cmd: 0,
         sep: false,
         radio: false,
         submenu: true,
@@ -370,6 +461,15 @@ fn build_menu() -> MenuSet {
             false,
         );
         add_sep(file);
+        add_item(
+            file,
+            IDM_SETTINGS,
+            "&Settings\tCtrl+,",
+            false,
+            false,
+            false,
+        );
+        add_sep(file);
         add_item(file, IDM_EXIT, "E&xit", false, false, false);
 
         let edit = CreatePopupMenu().unwrap_or_default();
@@ -389,10 +489,46 @@ fn build_menu() -> MenuSet {
             false,
             false,
         );
+        add_item(
+            edit,
+            IDM_DUP_LINE,
+            "D&uplicate Line\tCtrl+D",
+            false,
+            false,
+            false,
+        );
+        add_sep(edit);
+        add_item(edit, IDM_FIND, "&Find...\tCtrl+F", false, false, false);
+        add_item(
+            edit,
+            IDM_REPLACE,
+            "&Replace...\tCtrl+H",
+            false,
+            false,
+            false,
+        );
+        add_item(edit, IDM_GOTO, "&Go To...\tCtrl+G", false, false, false);
+        add_item(edit, IDM_FIND_NEXT, "Find &Next\tF3", false, false, false);
+        add_item(
+            edit,
+            IDM_FIND_PREV,
+            "Find Pre&vious\tShift+F3",
+            false,
+            false,
+            false,
+        );
 
         let view = CreatePopupMenu().unwrap_or_default();
         add_item(view, IDM_WORD_WRAP, "&Word Wrap", false, false, true);
         add_item(view, IDM_STATUS_BAR, "&Status Bar", false, false, true);
+        add_item(
+            view,
+            IDM_LINE_NUMBERS,
+            "&Line Numbers",
+            false,
+            false,
+            true,
+        );
         add_sep(view);
         add_item(
             view,
@@ -458,36 +594,6 @@ fn build_menu() -> MenuSet {
     }
 }
 
-fn create_accel() -> HACCEL {
-    let ctrl = |key: u16, cmd: u32| ACCEL {
-        fVirt: FVIRTKEY | FCONTROL,
-        key,
-        cmd: cmd as u16,
-    };
-    let ctrl_shift = |key: u16, cmd: u32| ACCEL {
-        fVirt: FVIRTKEY | FCONTROL | FSHIFT,
-        key,
-        cmd: cmd as u16,
-    };
-    let accels = [
-        ctrl(b'N' as u16, IDM_NEW_WINDOW),
-        ctrl(b'T' as u16, IDM_NEW_TAB),
-        ctrl(b'O' as u16, IDM_OPEN),
-        ctrl(b'S' as u16, IDM_SAVE),
-        ctrl_shift(b'S' as u16, IDM_SAVE_AS),
-        ctrl(b'W' as u16, IDM_CLOSE_TAB),
-        ctrl(b'Z' as u16, IDM_UNDO),
-        ctrl(b'Y' as u16, IDM_REDO),
-        ctrl(b'A' as u16, IDM_SELECT_ALL),
-        ctrl(VK_TAB.0, IDM_NEXT_TAB),
-        ctrl_shift(VK_TAB.0, IDM_PREV_TAB),
-        ctrl(VK_OEM_PLUS.0, IDM_ZOOM_IN),
-        ctrl(VK_OEM_MINUS.0, IDM_ZOOM_OUT),
-        ctrl(b'0' as u16, IDM_ZOOM_RESET),
-    ];
-    unsafe { CreateAcceleratorTableW(&accels).unwrap_or_default() }
-}
-
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -517,7 +623,12 @@ unsafe extern "system" fn wnd_proc(
 }
 
 impl App {
-    fn new(mode: ThemeMode, menus: MenuSet) -> Self {
+    fn new(
+        mode: ThemeMode,
+        menus: MenuSet,
+        binds: Vec<Option<Bind>>,
+        prefs: settings::Prefs,
+    ) -> Self {
         let theme = if theme::effective_dark(mode) {
             theme::dark_theme()
         } else {
@@ -525,19 +636,21 @@ impl App {
         };
         Self {
             hwnd: HWND::default(),
-            tab: HWND::default(),
-            status: HWND::default(),
             menus,
             menu_hot: -1,
             menu_open: -1,
             plus_hot: false,
             tab_hot: -1,
             close_hot: -1,
+            close_press: -1,
             menu_brush: HBRUSH::default(),
             docs: Vec::new(),
             active: None,
-            word_wrap: true,
-            show_status: true,
+            word_wrap: prefs.word_wrap,
+            show_status: prefs.status_bar,
+            line_numbers: prefs.line_numbers,
+            auto_indent: prefs.auto_indent,
+            edit_pt: prefs.font_pt,
             dpi: 96,
             font: HFONT::default(),
             ui_face: String::new(),
@@ -545,7 +658,13 @@ impl App {
             next_id: EDIT_ID_BASE,
             mode,
             theme,
-            status_text: [[0; 96]; 5],
+            status_text: Default::default(),
+            tab_w: 0,
+            gutter_w: 0,
+            binds,
+            findbar: HWND::default(),
+            find_query: Vec::new(),
+            settings_hwnd: HWND::default(),
         }
     }
 
@@ -557,52 +676,6 @@ impl App {
             self.edit_face = pick_face(hdc, &["Cascadia Mono", "Cascadia Code", "Consolas"]);
             let _ = ReleaseDC(Some(self.hwnd), hdc);
             self.font = ui_font(self.dpi, &self.ui_face);
-
-            self.tab = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                WC_TABCONTROL,
-                PCWSTR::null(),
-                WINDOW_STYLE(
-                    (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS).0
-                        | TCS_OWNERDRAWFIXED
-                        | TCS_FIXEDWIDTH
-                        | TCS_FOCUSNEVER,
-                ),
-                0,
-                0,
-                0,
-                0,
-                Some(self.hwnd),
-                None,
-                None,
-                None,
-            )
-            .unwrap_or_default();
-            sm(self.tab, WM_SETFONT, self.font.0 as usize, 1);
-            let _ = SetWindowSubclass(self.tab, Some(tab_proc), TAB_SUBCLASS, self.hwnd.0 as usize);
-
-            self.status = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                STATUSCLASSNAMEW,
-                PCWSTR::null(),
-                WS_CHILD,
-                0,
-                0,
-                0,
-                0,
-                Some(self.hwnd),
-                None,
-                None,
-                None,
-            )
-            .unwrap_or_default();
-            sm(self.status, WM_SETFONT, self.font.0 as usize, 1);
-            let _ = SetWindowSubclass(
-                self.status,
-                Some(status_proc),
-                STATUS_SUBCLASS,
-                self.hwnd.0 as usize,
-            );
 
             self.measure_strip();
             self.recompute_menu_metrics();
@@ -617,7 +690,8 @@ impl App {
                 }
             }
             self.apply_theme();
-            self.layout();
+            self.apply_binds();
+            self.apply_prefs();
             crate::install::update_check_async();
         }
     }
@@ -643,27 +717,86 @@ impl App {
                     let mut ps = PAINTSTRUCT::default();
                     let hdc = BeginPaint(self.hwnd, &mut ps);
                     self.paint_menu_strip(hdc);
+                    self.paint_tabs(hdc);
+                    self.paint_gutter(hdc);
+                    self.paint_status(hdc);
                     let _ = EndPaint(self.hwnd, &mut ps);
                     LRESULT(0)
                 }
                 WM_MOUSEMOVE => {
-                    self.on_strip_hover(x_lparam(lparam), y_lparam(lparam));
+                    self.on_mouse_move(x_lparam(lparam), y_lparam(lparam));
                     LRESULT(0)
                 }
                 WM_MOUSELEAVE => {
-                    if self.menu_hot >= 0 {
+                    if self.menu_hot >= 0 || self.tab_hot >= 0 || self.plus_hot {
                         self.menu_hot = -1;
+                        self.tab_hot = -1;
+                        self.close_hot = -1;
+                        self.plus_hot = false;
                         self.invalidate_strip();
+                        self.invalidate_tabs();
                     }
                     LRESULT(0)
                 }
                 WM_LBUTTONDOWN => {
-                    if let Some(i) = self.strip_hit(x_lparam(lparam), y_lparam(lparam)) {
+                    let (x, y) = (x_lparam(lparam), y_lparam(lparam));
+                    if let Some(i) = self.strip_hit(x, y) {
                         self.menu_loop(i);
-                        LRESULT(0)
-                    } else {
-                        DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                        return LRESULT(0);
                     }
+                    if let Some(i) = self.close_at(x, y) {
+                        self.close_press = i as i32;
+                        let _ = SetCapture(self.hwnd);
+                        return LRESULT(0);
+                    }
+                    if let Some(i) = self.tab_at(x, y) {
+                        self.set_active(i);
+                        return LRESULT(0);
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                }
+                WM_LBUTTONUP => {
+                    let (x, y) = (x_lparam(lparam), y_lparam(lparam));
+                    if self.close_press >= 0 {
+                        let i = self.close_press;
+                        self.close_press = -1;
+                        let _ = ReleaseCapture();
+                        if self.close_at(x, y) == Some(i as usize) {
+                            self.close_tab(i as usize);
+                        }
+                        return LRESULT(0);
+                    }
+                    if pt_in_rect(&self.plus_rect(), x, y) {
+                        self.new_document(None);
+                        return LRESULT(0);
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                }
+                WM_MBUTTONUP => {
+                    if let Some(i) = self.tab_at(x_lparam(lparam), y_lparam(lparam)) {
+                        self.close_tab(i);
+                        return LRESULT(0);
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                }
+                WM_LBUTTONDBLCLK => {
+                    let (x, y) = (x_lparam(lparam), y_lparam(lparam));
+                    if y >= self.menu_h()
+                        && y < self.menu_h() + self.tab_strip_h()
+                        && self.tab_at(x, y).is_none()
+                    {
+                        self.new_document(None);
+                        return LRESULT(0);
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                }
+                WM_MOUSEWHEEL => {
+                    // Ctrl+wheel zooms the editor.
+                    if (wparam.0 as u16 & 0x0008) != 0 {
+                        self.zoom(if (wparam.0 >> 16) as i16 > 0 { 1 } else { -1 });
+                        return LRESULT(0);
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
                 }
                 WM_SYSKEYDOWN => {
                     if wparam.0 == VK_F10.0 as usize {
@@ -693,10 +826,6 @@ impl App {
                     let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
                     if dis.CtlType == ODT_MENU {
                         self.draw_menu_item(dis);
-                    } else if dis.hwndItem.0 == self.tab.0 {
-                        self.draw_tab(dis);
-                    } else if dis.hwndItem.0 == self.status.0 {
-                        self.draw_status_part(dis);
                     }
                     LRESULT(1)
                 }
@@ -720,7 +849,7 @@ impl App {
                     mmi.ptMinTrackSize.y = scale(240, self.dpi);
                     LRESULT(0)
                 }
-                // Empty menu-strip space acts as a drag handle for the window.
+                // Empty menu-strip and tab-strip space drags the window.
                 WM_NCHITTEST => {
                     let r = DefWindowProcW(self.hwnd, msg, wparam, lparam);
                     if r.0 == HTCLIENT as isize {
@@ -729,7 +858,15 @@ impl App {
                             y: y_lparam(lparam),
                         };
                         let _ = ScreenToClient(self.hwnd, &mut p);
-                        if p.y < self.menu_h() && self.strip_hit(p.x, p.y).is_none() {
+                        if p.y < self.menu_h() {
+                            if self.strip_hit(p.x, p.y).is_none() {
+                                return LRESULT(HTCAPTION as isize);
+                            }
+                        } else if p.y < self.menu_h() + self.tab_strip_h()
+                            && self.tab_at(p.x, p.y).is_none()
+                            && self.close_at(p.x, p.y).is_none()
+                            && !pt_in_rect(&self.plus_rect(), p.x, p.y)
+                        {
                             return LRESULT(HTCAPTION as isize);
                         }
                     }
@@ -805,12 +942,7 @@ impl App {
             ) else {
                 return;
             };
-            sm(
-                edit,
-                EM_SETEVENTMASK,
-                0,
-                (ENM_CHANGE | ENM_SELCHANGE) as isize,
-            );
+            sm(edit, EM_SETEVENTMASK, 0, EDIT_EVENTS as isize);
             sm(edit, EM_EXLIMITTEXT, 0, 0x4000_0000);
             sm(edit, EM_AUTOURLDETECT, 0, 0);
             sm(
@@ -825,17 +957,12 @@ impl App {
                 0,
                 if self.word_wrap { 0 } else { 1 },
             );
-            set_editor_font(edit, &self.edit_face);
+            set_editor_font(edit, &self.edit_face, self.edit_pt);
             apply_editor_theme(edit, &self.theme);
             let _ = SetWindowSubclass(edit, Some(edit_proc), EDIT_SUBCLASS, self.hwnd.0 as usize);
             sm(edit, EM_SETMODIFY, 0, 0);
 
-            let mut doc = Document {
-                edit,
-                path,
-                encoding: Encoding::Utf8,
-                zoom: 100,
-            };
+            let mut doc = Document::new(edit, path);
             if let Some(p) = doc.path.clone() {
                 match load_file(edit, &p) {
                     Ok(enc) => doc.encoding = enc,
@@ -854,7 +981,6 @@ impl App {
             }
             self.docs.push(doc);
             let idx = self.docs.len() - 1;
-            self.insert_tab_item(idx);
             self.set_active(idx);
             self.layout();
         }
@@ -865,7 +991,7 @@ impl App {
             return;
         }
         self.active = Some(idx);
-        sm(self.tab, TCM_SETCURSEL, idx, 0);
+        self.invalidate_tabs();
         unsafe {
             for (i, d) in self.docs.iter().enumerate() {
                 let _ = ShowWindow(d.edit, if i == idx { SW_SHOW } else { SW_HIDE });
@@ -894,7 +1020,7 @@ impl App {
             let _ = RemoveWindowSubclass(doc.edit, Some(edit_proc), EDIT_SUBCLASS);
             let _ = DestroyWindow(doc.edit);
         }
-        sm(self.tab, TCM_DELETEITEM, idx, 0);
+        self.invalidate_tabs();
         if self.docs.is_empty() {
             unsafe {
                 let _ = DestroyWindow(self.hwnd);
@@ -921,24 +1047,11 @@ impl App {
         idx < self.docs.len() && sm(self.docs[idx].edit, EM_GETMODIFY, 0, 0).0 != 0
     }
 
-    fn insert_tab_item(&self, idx: usize) {
-        let text = wide(&self.tab_label(idx));
-        let item = TCITEMW {
-            mask: TCIF_TEXT,
-            pszText: PWSTR(text.as_ptr() as *mut u16),
-            ..Default::default()
-        };
-        sm(self.tab, TCM_INSERTITEMW, idx, &item as *const _ as isize);
-    }
-
+    /// Repaint a tab (label or dirty state changed).
     fn refresh_tab(&self, idx: usize) {
-        let text = wide(&self.tab_label(idx));
-        let item = TCITEMW {
-            mask: TCIF_TEXT,
-            pszText: PWSTR(text.as_ptr() as *mut u16),
-            ..Default::default()
-        };
-        sm(self.tab, TCM_SETITEMW, idx, &item as *const _ as isize);
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), Some(&self.tab_cell(idx)), false);
+        }
     }
 
     fn update_title(&self) {
@@ -971,60 +1084,49 @@ impl App {
         unsafe {
             let _ = DeleteObject(HGDIOBJ(self.font.0));
             self.font = ui_font(d, &self.ui_face);
-            sm(self.tab, WM_SETFONT, self.font.0 as usize, 1);
-            sm(self.status, WM_SETFONT, self.font.0 as usize, 1);
         }
+        findbar::retheme(self);
         self.measure_strip();
         self.recompute_menu_metrics();
     }
 
-    fn layout(&mut self) {
+    pub(crate) fn layout(&mut self) {
         self.refresh_dpi();
         unsafe {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
             let (cx, cy) = (rc.right, rc.bottom);
             let menu_h = self.menu_h();
-            let tab_h = scale(32, self.dpi);
-            let plus_w = tab_h; // room for the strip-drawn "+" after last tab
-            let status_h = if self.show_status {
-                scale(23, self.dpi)
-            } else {
-                0
-            };
+            let tab_h = self.tab_strip_h();
+            let bar_h = findbar::height(self);
+            let status_h = self.status_h();
             // Tabs shrink to fit like Notepad's, down to a sensible minimum.
             let n = self.docs.len().max(1) as i32;
-            let tab_w = ((cx - plus_w) / n).clamp(scale(64, self.dpi), scale(176, self.dpi));
-            sm(
-                self.tab,
-                TCM_SETITEMSIZE,
-                0,
-                ((tab_w & 0xFFFF) | (tab_h << 16)) as isize,
-            );
-            let _ = SetWindowPos(self.tab, None, 0, menu_h, cx, tab_h, SWP_NOZORDER);
-            if self.show_status {
-                let _ = ShowWindow(self.status, SW_SHOW);
+            let pad = scale(4, self.dpi);
+            self.tab_w =
+                ((cx - pad * 2 - tab_h) / n).clamp(scale(64, self.dpi), scale(176, self.dpi));
+            // Line-number gutter: width follows the active doc's line count.
+            self.gutter_w = self.wanted_gutter_w();
+            if !self.findbar.0.is_null() {
                 let _ = SetWindowPos(
-                    self.status,
-                    None,
-                    0,
-                    cy - status_h,
-                    cx,
-                    status_h,
-                    SWP_NOZORDER,
-                );
-                self.update_status_parts(cx);
-            } else {
-                let _ = ShowWindow(self.status, SW_HIDE);
-            }
-            let edit_h = (cy - menu_h - tab_h - status_h).max(0);
-            for d in &self.docs {
-                let _ = SetWindowPos(
-                    d.edit,
+                    self.findbar,
                     None,
                     0,
                     menu_h + tab_h,
                     cx,
+                    bar_h,
+                    SWP_NOZORDER,
+                );
+            }
+            let edit_y = menu_h + tab_h + bar_h;
+            let edit_h = (cy - edit_y - status_h).max(0);
+            for d in &self.docs {
+                let _ = SetWindowPos(
+                    d.edit,
+                    None,
+                    self.gutter_w,
+                    edit_y,
+                    cx - self.gutter_w,
                     edit_h,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
@@ -1032,62 +1134,12 @@ impl App {
                 let mut fr = RECT {
                     left: scale(10, self.dpi),
                     top: scale(6, self.dpi),
-                    right: (cx - scale(10, self.dpi)).max(0),
+                    right: (cx - self.gutter_w - scale(10, self.dpi)).max(0),
                     bottom: (edit_h - scale(4, self.dpi)).max(0),
                 };
                 sm(d.edit, EM_SETRECT, 0, &mut fr as *mut RECT as isize);
             }
         }
-    }
-
-    fn update_status_parts(&self, cx: i32) {
-        let d = self.dpi as i32;
-        let edges = [
-            cx - 430 * d / 96,
-            cx - 320 * d / 96,
-            cx - 250 * d / 96,
-            cx - 140 * d / 96,
-            -1,
-        ];
-        sm(
-            self.status,
-            SB_SETPARTS,
-            edges.len(),
-            edges.as_ptr() as isize,
-        );
-        // Part 0 gets owner-draw too so it doesn't render with the sunken
-        // edge — the pointer is stored for later WM_DRAWITEM, so it must be
-        // a static, not a stack local.
-        static EMPTY_PART: [u16; 1] = [0];
-        sm(
-            self.status,
-            SB_SETTEXTW,
-            SBT_OWNERDRAW as usize,
-            EMPTY_PART.as_ptr() as isize,
-        );
-        // SB_SETTEXT is dropped for parts that don't exist yet, so re-attach
-        // the stored buffers every time the parts are (re)created here.
-        for i in 1..self.status_text.len() {
-            sm(
-                self.status,
-                SB_SETTEXTW,
-                i | SBT_OWNERDRAW as usize,
-                self.status_text[i].as_ptr() as isize,
-            );
-        }
-    }
-
-    fn set_status_part(&mut self, part: usize, text: &str) {
-        let w = wide(text);
-        let n = (w.len() - 1).min(95);
-        self.status_text[part][..n].copy_from_slice(&w[..n]);
-        self.status_text[part][n] = 0;
-        sm(
-            self.status,
-            SB_SETTEXTW,
-            part | SBT_OWNERDRAW as usize,
-            self.status_text[part].as_ptr() as isize,
-        );
     }
 
     fn update_status(&mut self) {
@@ -1099,33 +1151,33 @@ impl App {
             let d = &self.docs[i];
             (d.edit, d.zoom, d.encoding.label())
         };
-        let mut lo = 0i32;
-        let mut hi = 0i32;
-        sm(
-            edit,
-            EM_GETSEL,
-            &mut lo as *mut i32 as usize,
-            &mut hi as *mut i32 as isize,
-        );
-        let line = sm(edit, EM_EXLINEFROMCHAR, 0, hi as isize).0 as i64;
-        let line_start = sm(edit, EM_LINEINDEX, line as usize, 0).0 as i64;
-        let col = hi as i64 - line_start;
-        self.set_status_part(1, &format!("Ln {}, Col {}", line + 1, col + 1));
-        self.set_status_part(2, &format!("{}%", zoom));
-        self.set_status_part(3, "Windows (CRLF)");
-        self.set_status_part(4, enc);
+        // After an undo RichEdit can select its final paragraph mark too.
+        let caret = get_sel(edit).cpMax.min(text_len(edit));
+        let (line, line_start) = self.line_at(i, caret);
+        let col = caret - line_start;
+        self.status_text = [
+            enc.to_string(),
+            "Windows (CRLF)".to_string(),
+            format!("{zoom}%"),
+            format!("Ln {}, Col {}", line + 1, col + 1),
+        ];
+        self.invalidate_status();
     }
 
     // ---- commands --------------------------------------------------------
 
     fn on_command(&mut self, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if lparam.0 != 0 {
-            if hiword(wparam.0) == EN_CHANGE {
+            if hiword(wparam.0) == EN_VSCROLL {
+                self.invalidate_gutter();
+            } else if hiword(wparam.0) == EN_CHANGE {
                 let edit = HWND(lparam.0 as *mut c_void);
                 if let Some(i) = self.docs.iter().position(|d| d.edit.0 == edit.0) {
+                    self.docs[i].lines_dirty = true;
                     self.refresh_tab(i);
                     if self.active == Some(i) {
                         self.update_title();
+                        self.invalidate_gutter();
                     }
                 }
             }
@@ -1154,6 +1206,7 @@ impl App {
                 IDM_EXIT => {
                     sm(self.hwnd, WM_CLOSE, 0, 0);
                 }
+                IDM_SETTINGS => settings::open(self),
                 IDM_UNDO => {
                     if let Some(e) = self.active_edit() {
                         sm(e, EM_UNDO, 0, 0);
@@ -1180,8 +1233,15 @@ impl App {
                     }
                 }
                 IDM_DELETE => {
+                    // The Del accelerator fires for every Delete press, so
+                    // with no selection hand the key to the editor itself.
                     if let Some(e) = self.active_edit() {
-                        sm(e, EM_REPLACESEL, 1, w!("").0 as isize);
+                        let sel = get_sel(e);
+                        if sel.cpMin == sel.cpMax {
+                            sm(e, WM_KEYDOWN, VK_DELETE.0 as usize, 0);
+                        } else {
+                            sm(e, EM_REPLACESEL, 1, w!("").0 as isize);
+                        }
                     }
                 }
                 IDM_SELECT_ALL => {
@@ -1191,6 +1251,13 @@ impl App {
                 }
                 IDM_WORD_WRAP => self.toggle_wrap(),
                 IDM_STATUS_BAR => self.toggle_status_bar(),
+                IDM_LINE_NUMBERS => self.toggle_line_numbers(),
+                IDM_FIND => findbar::open(self, BarMode::Find),
+                IDM_REPLACE => findbar::open(self, BarMode::Replace),
+                IDM_GOTO => findbar::open(self, BarMode::Goto),
+                IDM_FIND_NEXT => self.find_next(true),
+                IDM_FIND_PREV => self.find_next(false),
+                IDM_DUP_LINE => self.duplicate_line(),
                 IDM_ZOOM_IN => self.zoom(1),
                 IDM_ZOOM_OUT => self.zoom(-1),
                 IDM_ZOOM_RESET => self.zoom(0),
@@ -1210,16 +1277,14 @@ impl App {
     fn on_notify(&mut self, lparam: LPARAM) -> LRESULT {
         unsafe {
             let hdr = &*(lparam.0 as *const NMHDR);
-            if hdr.hwndFrom.0 == self.tab.0 {
-                if hdr.code == TCN_SELCHANGE {
-                    let sel = sm(self.tab, TCM_GETCURSEL, 0, 0).0;
-                    if sel >= 0 && (sel as usize) < self.docs.len() {
-                        self.set_active(sel as usize);
-                    }
-                }
-            } else if hdr.code == EN_SELCHANGE {
+            let is_edit = self.docs.iter().any(|d| d.edit.0 == hdr.hwndFrom.0);
+            if !is_edit {
+                return LRESULT(0);
+            }
+            if hdr.code == EN_SELCHANGE {
                 if self.active_edit().map(|e| e.0) == Some(hdr.hwndFrom.0) {
                     self.update_status();
+                    self.invalidate_gutter();
                 }
             }
         }
@@ -1279,46 +1344,81 @@ impl App {
 
     fn toggle_wrap(&mut self) {
         self.word_wrap = !self.word_wrap;
-        unsafe {
-            let _ = CheckMenuItem(
-                self.menus.view,
-                IDM_WORD_WRAP,
-                (MF_BYCOMMAND
-                    | if self.word_wrap {
-                        MF_CHECKED
-                    } else {
-                        MF_UNCHECKED
-                    })
-                .0,
-            );
-            for d in &self.docs {
-                sm(
-                    d.edit,
-                    EM_SETTARGETDEVICE,
-                    0,
-                    if self.word_wrap { 0 } else { 1 },
-                );
-            }
-        }
+        settings::save_pref("WordWrap", self.word_wrap as u32);
+        self.apply_prefs();
     }
 
     fn toggle_status_bar(&mut self) {
         self.show_status = !self.show_status;
+        settings::save_pref("StatusBar", self.show_status as u32);
+        self.apply_prefs();
+    }
+
+    fn toggle_line_numbers(&mut self) {
+        self.line_numbers = !self.line_numbers;
+        settings::save_pref("LineNumbers", self.line_numbers as u32);
+        self.apply_prefs();
+    }
+
+    fn check_menu(&self, cmd: u32, on: bool) {
         unsafe {
             let _ = CheckMenuItem(
                 self.menus.view,
-                IDM_STATUS_BAR,
-                (MF_BYCOMMAND
-                    | if self.show_status {
-                        MF_CHECKED
-                    } else {
-                        MF_UNCHECKED
-                    })
-                .0,
+                cmd,
+                (MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED }).0,
             );
+        }
+    }
+
+    /// Pushes the view preferences (wrap, status bar, line numbers) out to
+    /// the menus, every editor, and the layout. Called at startup and
+    /// whenever the View menu or Settings changes one.
+    pub(crate) fn apply_prefs(&mut self) {
+        self.check_menu(IDM_WORD_WRAP, self.word_wrap);
+        self.check_menu(IDM_STATUS_BAR, self.show_status);
+        self.check_menu(IDM_LINE_NUMBERS, self.line_numbers);
+        for d in &self.docs {
+            sm(d.edit, EM_SETTARGETDEVICE, 0, if self.word_wrap { 0 } else { 1 });
         }
         self.layout();
         self.update_status();
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    /// Re-applies the editor font size from Settings to every tab.
+    pub(crate) fn apply_font_size(&mut self) {
+        for d in &self.docs {
+            set_editor_font(d.edit, &self.edit_face, self.edit_pt);
+        }
+        self.layout();
+        self.invalidate_gutter();
+    }
+
+    /// Rebuilds the accelerator table from the current bindings and
+    /// relabels the menus so their shortcut column matches.
+    pub(crate) fn apply_binds(&mut self) {
+        unsafe {
+            let table = settings::build_accel(ACTIONS, &self.binds);
+            let old = ACCEL.swap(table.0 as usize, Ordering::Relaxed);
+            if old != 0 && old != table.0 as usize {
+                let _ = DestroyAcceleratorTable(HACCEL(old as *mut c_void));
+            }
+            for &m in &self.menus.popups {
+                for pos in 0..GetMenuItemCount(Some(m)).max(0) as u32 {
+                    let Some(d) = menu_item_data(m, pos) else { continue };
+                    if (*d).cmd == 0 {
+                        continue;
+                    }
+                    if let Some(k) = ACTIONS.iter().position(|a| a.cmd == (*d).cmd) {
+                        let text = self.binds[k].map(|b| b.text()).unwrap_or_default();
+                        (*d).accel = wide(&text);
+                    }
+                }
+            }
+        }
+        self.recompute_menu_metrics();
     }
 
     fn zoom(&mut self, dir: i32) {
@@ -1331,6 +1431,9 @@ impl App {
         };
         sm(d.edit, EM_SETZOOM, (d.zoom / 10) as usize, 10);
         self.update_status();
+        // Gutter numbers follow the editor's zoomed text size.
+        self.layout();
+        self.invalidate_gutter();
     }
 
     fn check_updates(&self) {
@@ -1382,7 +1485,7 @@ impl App {
 
     // ---- theme -------------------------------------------------------------
 
-    fn set_theme(&mut self, mode: ThemeMode) {
+    pub(crate) fn set_theme(&mut self, mode: ThemeMode) {
         if self.mode == mode {
             return;
         }
@@ -1404,14 +1507,8 @@ impl App {
         for d in &self.docs {
             apply_editor_theme(d.edit, &self.theme);
         }
-        theme::set_control_dark(self.tab, dark);
-        theme::set_control_dark(self.status, dark);
-        sm(
-            self.status,
-            SB_SETBKCOLOR,
-            0,
-            self.theme.chrome_bg.0 as isize,
-        );
+        findbar::retheme(self);
+        settings::retheme(self);
         unsafe {
             let _ = CheckMenuRadioItem(
                 self.menus.theme,
@@ -1444,34 +1541,57 @@ impl App {
         }
     }
 
-    /// Index of the tab under a strip-space point, if any.
-    fn tab_hit(&self, tab: HWND, x: i32, y: i32) -> Option<usize> {
-        let mut ht = TCHITTESTINFO {
-            pt: POINT { x, y },
-            ..Default::default()
-        };
-        let i = sm(tab, TCM_HITTEST, 0, &mut ht as *mut TCHITTESTINFO as isize).0;
-        (i >= 0 && (i as usize) < self.docs.len()).then_some(i as usize)
+    // ---- hand-drawn tab strip -----------------------------------------------
+    // The strip is painted by the main window itself — no SysTabControl32, so
+    // no default frames, focus rects, or theme edges can leak through.
+
+    fn tab_strip_h(&self) -> i32 {
+        scale(32, self.dpi)
     }
 
-    /// Index of the tab whose close button is under the point. Only counts
-    /// where the button is visible — the selected or hovered tab.
-    fn tab_close_hit(&self, tab: HWND, x: i32, y: i32) -> Option<usize> {
-        let i = self.tab_hit(tab, x, y)?;
-        let visible = i as i32 == self.tab_hot || self.active == Some(i);
-        if !visible {
+    fn status_h(&self) -> i32 {
+        if self.show_status {
+            scale(24, self.dpi)
+        } else {
+            0
+        }
+    }
+
+    /// Top of the editing area (tab strip bottom + find bar when open).
+    fn edit_top(&self) -> i32 {
+        self.menu_h() + self.tab_strip_h() + findbar::height(self)
+    }
+
+    /// Client-coord cell for tab `i` inside the strip.
+    fn tab_cell(&self, i: usize) -> RECT {
+        let pad = scale(4, self.dpi);
+        let top = self.menu_h();
+        RECT {
+            left: pad + i as i32 * self.tab_w,
+            top,
+            right: pad + (i as i32 + 1) * self.tab_w,
+            bottom: top + self.tab_strip_h(),
+        }
+    }
+
+    fn tab_at(&self, x: i32, y: i32) -> Option<usize> {
+        if y < self.menu_h() || y >= self.menu_h() + self.tab_strip_h() {
             return None;
         }
-        let mut ir = RECT::default();
-        sm(tab, TCM_GETITEMRECT, i, &mut ir as *mut RECT as isize);
-        pt_in_rect(&self.tab_close_rect(&ir), x, y).then_some(i)
+        let pad = scale(4, self.dpi);
+        let i = (x - pad) / self.tab_w.max(1);
+        if i >= 0 && (i as usize) < self.docs.len() && x >= pad {
+            Some(i as usize)
+        } else {
+            None
+        }
     }
 
-    /// Close-button box inside a tab's item rect.
-    fn tab_close_rect(&self, item: &RECT) -> RECT {
+    /// Close-button box inside a tab cell.
+    fn close_rect_for(&self, cell: &RECT) -> RECT {
         let side = scale(18, self.dpi);
-        let cy = (item.top + item.bottom) / 2;
-        let right = item.right - scale(7, self.dpi);
+        let cy = (cell.top + cell.bottom) / 2;
+        let right = cell.right - scale(8, self.dpi);
         RECT {
             left: right - side,
             top: cy - side / 2,
@@ -1480,36 +1600,245 @@ impl App {
         }
     }
 
-    fn draw_tab(&self, dis: &DRAWITEMSTRUCT) {
-        unsafe {
-            let i = dis.itemID as usize;
-            if i >= self.docs.len() {
-                return;
-            }
-            let th = self.theme;
-            let selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+    fn close_at(&self, x: i32, y: i32) -> Option<usize> {
+        let i = self.tab_at(x, y)?;
+        let visible = self.tab_hot == i as i32 || self.active == Some(i);
+        if !visible {
+            return None;
+        }
+        pt_in_rect(&self.close_rect_for(&self.tab_cell(i)), x, y).then_some(i)
+    }
 
-            // Flat base fill only — the control draws its raised frame around
-            // the selected item *outside* rcItem, so the rounded pill is drawn
-            // later over the whole cell in tab_proc's paint overlay.
-            let bg = if selected {
-                th.tab_sel
-            } else if self.tab_hot == i as i32 {
-                th.tab_hot
-            } else {
-                th.chrome_bg
-            };
-            let brush = CreateSolidBrush(bg);
-            FillRect(dis.hDC, &dis.rcItem, brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
-
-            self.draw_tab_contents(dis.hDC, i, &dis.rcItem, selected);
+    /// The "+" button sits just after the last tab cell.
+    fn plus_rect(&self) -> RECT {
+        let side = scale(22, self.dpi);
+        let strip_top = self.menu_h();
+        let top = strip_top + (self.tab_strip_h() - side) / 2;
+        let left = scale(4, self.dpi) + self.docs.len() as i32 * self.tab_w + scale(4, self.dpi);
+        RECT {
+            left,
+            top,
+            right: left + side,
+            bottom: top + side,
         }
     }
 
-    /// Label + dirty dot + close button for one tab, positioned inside `cell`
-    /// (the owner-draw item rect or the full cell in the paint overlay).
-    fn draw_tab_contents(&self, hdc: HDC, i: usize, cell: &RECT, selected: bool) {
+    fn invalidate_tabs(&self) {
+        unsafe {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut rc);
+            rc.top = self.menu_h();
+            rc.bottom = rc.top + self.tab_strip_h();
+            let _ = InvalidateRect(Some(self.hwnd), Some(&rc), false);
+        }
+    }
+
+    fn invalidate_gutter(&mut self) {
+        // Digit-count growth needs a relayout so the gutter can widen.
+        if self.line_numbers && self.wanted_gutter_w() != self.gutter_w {
+            self.layout();
+            return;
+        }
+        if self.gutter_w <= 0 {
+            return;
+        }
+        unsafe {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut rc);
+            let top = self.edit_top();
+            let band = RECT {
+                left: 0,
+                top,
+                right: self.gutter_w,
+                bottom: rc.bottom,
+            };
+            let _ = InvalidateRect(Some(self.hwnd), Some(&band), false);
+        }
+    }
+
+    /// Gutter width for the active doc's line count (0 when disabled).
+    fn wanted_gutter_w(&mut self) -> i32 {
+        let Some(i) = self.active.filter(|_| self.line_numbers) else {
+            return 0;
+        };
+        let lines = self.line_starts(i).len().max(1);
+        let digits = (lines.ilog10() as i32 + 1).max(2);
+        unsafe {
+            let font = self.gutter_font();
+            let hdc = GetDC(Some(self.hwnd));
+            let old = SelectObject(hdc, HGDIOBJ(font.0));
+            let digit_w = text_extent(hdc, &wide("0"));
+            SelectObject(hdc, old);
+            let _ = ReleaseDC(Some(self.hwnd), hdc);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+            scale(14, self.dpi) + digits * digit_w + scale(10, self.dpi)
+        }
+    }
+
+    /// Editor face at the active tab's zoomed size, so gutter numbers sit
+    /// on the same baselines as the text. Caller deletes it.
+    fn gutter_font(&self) -> HFONT {
+        let zoom = self.active.map(|i| self.docs[i].zoom).unwrap_or(100);
+        let px = self.edit_pt * self.dpi as i32 * zoom / (72 * 100);
+        let face = wide(&self.edit_face);
+        unsafe {
+            CreateFontW(
+                -px.max(6),
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                0,
+                PCWSTR(face.as_ptr()),
+            )
+        }
+    }
+
+    // ---- logical lines --------------------------------------------------
+
+    /// Logical line starts for doc `i`, rebuilt after any edit. RichEdit
+    /// stores line breaks as a single CR, which is what char offsets count.
+    fn line_starts(&mut self, i: usize) -> &[i32] {
+        let d = &mut self.docs[i];
+        if d.lines_dirty {
+            let text = get_text_raw(d.edit);
+            d.line_starts.clear();
+            d.line_starts.push(0);
+            d.line_starts.extend(
+                text.iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c == 13)
+                    .map(|(k, _)| k as i32 + 1),
+            );
+            d.lines_dirty = false;
+        }
+        &self.docs[i].line_starts
+    }
+
+    /// (0-based logical line, its start offset) for char offset `cp`.
+    fn line_at(&mut self, i: usize, cp: i32) -> (usize, i32) {
+        let starts = self.line_starts(i);
+        let ln = starts.partition_point(|&s| s <= cp).saturating_sub(1);
+        (ln, starts[ln])
+    }
+
+    /// 1-based logical line of the caret in the active tab.
+    pub(crate) fn caret_line(&mut self) -> usize {
+        let Some(i) = self.active else { return 1 };
+        let caret = get_sel(self.docs[i].edit).cpMax;
+        self.line_at(i, caret).0 + 1
+    }
+
+    /// End offset of logical line `ln`, excluding its line break.
+    fn line_end(&mut self, i: usize, ln: usize) -> i32 {
+        let edit = self.docs[i].edit;
+        match self.line_starts(i).get(ln + 1) {
+            Some(&next) => next - 1,
+            None => text_len(edit),
+        }
+    }
+
+    /// Unified hover tracking for the menu strip and tab strip.
+    fn on_mouse_move(&mut self, x: i32, y: i32) {
+        let menu_hit = self.strip_hit(x, y).map(|i| i as i32).unwrap_or(-1);
+        let tab_hit = self.tab_at(x, y).map(|i| i as i32).unwrap_or(-1);
+        let close_hit = self.close_at(x, y).map(|i| i as i32).unwrap_or(-1);
+        let plus_hit = pt_in_rect(&self.plus_rect(), x, y);
+        if menu_hit != self.menu_hot {
+            self.menu_hot = menu_hit;
+            self.invalidate_strip();
+        }
+        if tab_hit != self.tab_hot
+            || close_hit != self.close_hot
+            || plus_hit != self.plus_hot
+        {
+            self.tab_hot = tab_hit;
+            self.close_hot = close_hit;
+            self.plus_hot = plus_hit;
+            self.invalidate_tabs();
+        }
+        if menu_hit >= 0 || tab_hit >= 0 || plus_hit {
+            unsafe {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: self.hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            }
+        }
+    }
+
+    /// Paints the whole tab strip — background, hairline, pills, labels.
+    fn paint_tabs(&self, hdc: HDC) {
+        unsafe {
+            let th = self.theme;
+            let mut rc = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut rc);
+            let top = self.menu_h();
+            let band = RECT {
+                left: 0,
+                top,
+                right: rc.right,
+                bottom: top + self.tab_strip_h(),
+            };
+            let b = CreateSolidBrush(th.chrome_bg);
+            FillRect(hdc, &band, b);
+            let _ = DeleteObject(HGDIOBJ(b.0));
+
+            // Hairline across the strip bottom — the selected tab's pill is
+            // drawn over it so the active tab merges into the editor.
+            let mut ln = band;
+            ln.top = ln.bottom - 1;
+            let hb = CreateSolidBrush(th.menu_sep);
+            FillRect(hdc, &ln, hb);
+            let _ = DeleteObject(HGDIOBJ(hb.0));
+
+            let aa = Aa::new(hdc);
+            let rad = scale(6, self.dpi);
+            for i in 0..self.docs.len() {
+                let cell = self.tab_cell(i);
+                let selected = self.active == Some(i);
+                let hot = self.tab_hot == i as i32;
+                if selected || hot {
+                    let mut pill = cell;
+                    pill.left += scale(2, self.dpi);
+                    pill.right -= scale(2, self.dpi);
+                    pill.top += scale(3, self.dpi);
+                    pill.bottom += rad; // clipped at band bottom — top corners stay round
+                    let saved = SaveDC(hdc);
+                    let _ = IntersectClipRect(
+                        hdc,
+                        band.left,
+                        band.top,
+                        band.right,
+                        band.bottom,
+                    );
+                    aa.fill_rounded(
+                        &pill,
+                        rad,
+                        true,
+                        if selected { th.tab_sel } else { th.tab_hot },
+                    );
+                    let _ = RestoreDC(hdc, saved);
+                }
+                self.draw_tab_contents(&aa, hdc, i, &cell, selected);
+            }
+
+            self.draw_plus(&aa);
+        }
+    }
+
+    /// Label + dirty dot + close button for one tab inside `cell`.
+    fn draw_tab_contents(&self, aa: &Aa, hdc: HDC, i: usize, cell: &RECT, selected: bool) {
         unsafe {
             let th = self.theme;
             let fg = if selected { th.tab_fg } else { th.tab_dim };
@@ -1517,19 +1846,21 @@ impl App {
             // Dirty dot: accent-colored, replaces the classic '*' prefix.
             let dirty = self.tab_modified(i);
             let mut text_rc = *cell;
-            text_rc.left += scale(10, self.dpi);
-            text_rc.right -= scale(28, self.dpi); // leave room for the close button
+            text_rc.left += scale(12, self.dpi);
+            text_rc.right -= scale(30, self.dpi); // room for the close button
             if dirty {
                 let r = scale(3, self.dpi).max(2);
                 let cy = (cell.top + cell.bottom) / 2;
                 let dx = text_rc.left + r;
-                let b = CreateSolidBrush(th.accent);
-                let oldb = SelectObject(hdc, HGDIOBJ(b.0));
-                let np = SelectObject(hdc, GetStockObject(NULL_PEN));
-                let _ = Ellipse(hdc, dx - r, cy - r, dx + r, cy + r);
-                SelectObject(hdc, np);
-                SelectObject(hdc, oldb);
-                let _ = DeleteObject(HGDIOBJ(b.0));
+                aa.fill_ellipse(
+                    &RECT {
+                        left: dx - r,
+                        top: cy - r,
+                        right: dx + r,
+                        bottom: cy + r,
+                    },
+                    th.accent,
+                );
                 text_rc.left += r * 2 + scale(6, self.dpi);
             }
 
@@ -1548,117 +1879,153 @@ impl App {
 
             // Close button on the selected or hovered tab.
             if selected || self.tab_hot == i as i32 {
-                let cr = self.tab_close_rect(cell);
-                if self.close_hot == i as i32 {
-                    let b = CreateSolidBrush(th.menu_hover);
-                    let saved = SaveDC(hdc);
-                    let _ = IntersectClipRect(hdc, cell.left, cell.top, cell.right, cell.bottom);
-                    let oldb = SelectObject(hdc, HGDIOBJ(b.0));
-                    let np = SelectObject(hdc, GetStockObject(NULL_PEN));
-                    let _ = Ellipse(hdc, cr.left, cr.top, cr.right, cr.bottom);
-                    SelectObject(hdc, np);
-                    SelectObject(hdc, oldb);
-                    let _ = DeleteObject(HGDIOBJ(b.0));
-                    let _ = RestoreDC(hdc, saved);
+                let cr = self.close_rect_for(cell);
+                if self.close_hot == i as i32 || self.close_press == i as i32 {
+                    aa.fill_ellipse(&cr, th.menu_hover);
                 }
-                draw_close_glyph(hdc, &cr, fg, self.dpi);
+                draw_close_glyph(aa, &cr, fg, self.dpi);
             }
         }
     }
 
-    /// Post-paint overlay (runs from tab_proc after the control paints): draws
-    /// the rounded-top pill over the *whole* cell for the selected/hovered
-    /// tab, which covers the control's default frame edge that sits just
-    /// outside the owner-draw item rect.
-    fn draw_tabs(&self, hdc: HDC) {
+    /// Line-number gutter — numbers the active editor's logical lines, with
+    /// wrapped continuation rows left blank. The caret's line is brighter.
+    fn paint_gutter(&mut self, hdc: HDC) {
+        if self.gutter_w <= 0 {
+            return;
+        }
+        let Some(i) = self.active else {
+            return;
+        };
+        let edit = self.docs[i].edit;
+        let caret_line = self.line_at(i, get_sel(edit).cpMax).0;
         unsafe {
-            let count = sm(self.tab, TCM_GETITEMCOUNT, 0, 0).0.max(0) as usize;
             let th = self.theme;
-            let rad = scale(6, self.dpi);
-            let mut client = RECT::default();
-            let _ = GetClientRect(self.tab, &mut client);
-            for i in 0..count {
-                let selected = self.active == Some(i);
-                let hot = self.tab_hot == i as i32;
-                if !selected && !hot {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut rc);
+            let top = self.edit_top();
+            let bottom = rc.bottom - self.status_h();
+            let band = RECT {
+                left: 0,
+                top,
+                right: self.gutter_w,
+                bottom,
+            };
+            let b = CreateSolidBrush(th.edit_bg);
+            FillRect(hdc, &band, b);
+            let _ = DeleteObject(HGDIOBJ(b.0));
+
+            let font = self.gutter_font();
+            let old = SelectObject(hdc, HGDIOBJ(font.0));
+            SetBkMode(hdc, TRANSPARENT);
+            let saved = SaveDC(hdc);
+            let _ = IntersectClipRect(hdc, band.left, band.top, band.right, band.bottom);
+            let first = sm(edit, EM_GETFIRSTVISIBLELINE, 0, 0).0.max(0);
+            let row_h = scale(40, self.dpi);
+            for row in first..first + 2000 {
+                let charidx = sm(edit, EM_LINEINDEX, row as usize, 0).0;
+                if charidx < 0 {
+                    break;
+                }
+                let mut pt = POINTL::default();
+                sm(
+                    edit,
+                    EM_POSFROMCHAR,
+                    &mut pt as *mut POINTL as usize,
+                    charidx,
+                );
+                let y = top + pt.y;
+                if y > bottom {
+                    break;
+                }
+                let (ln, start) = self.line_at(i, charidx as i32);
+                if start != charidx as i32 {
+                    continue; // wrapped continuation row — no number
+                }
+                SetTextColor(hdc, if ln == caret_line { th.tab_fg } else { th.menu_dim });
+                let mut r = RECT {
+                    left: 0,
+                    top: y,
+                    right: band.right - scale(10, self.dpi),
+                    bottom: y + row_h,
+                };
+                let mut t = wide(&(ln + 1).to_string());
+                let n = t.len() - 1;
+                DrawTextW(hdc, &mut t[..n], &mut r, DT_RIGHT | DT_TOP | DT_SINGLELINE);
+            }
+            let _ = RestoreDC(hdc, saved);
+            SelectObject(hdc, old);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+    }
+
+    fn status_band(&self) -> RECT {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut rc);
+        }
+        rc.top = rc.bottom - self.status_h();
+        rc
+    }
+
+    fn invalidate_status(&self) {
+        if self.show_status {
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), Some(&self.status_band()), false);
+            }
+        }
+    }
+
+    /// Status band: flat chrome strip with a hairline on top and segments
+    /// laid out from the right edge, split by short dividers.
+    fn paint_status(&self, hdc: HDC) {
+        if !self.show_status {
+            return;
+        }
+        unsafe {
+            let th = self.theme;
+            let band = self.status_band();
+            let b = CreateSolidBrush(th.chrome_bg);
+            FillRect(hdc, &band, b);
+            let _ = DeleteObject(HGDIOBJ(b.0));
+            let sep = CreateSolidBrush(th.menu_sep);
+            let mut ln = band;
+            ln.bottom = ln.top + 1;
+            FillRect(hdc, &ln, sep);
+
+            let old = SelectObject(hdc, HGDIOBJ(self.font.0));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, th.status_fg);
+            let pad = scale(12, self.dpi);
+            let mut right = band.right - scale(6, self.dpi);
+            for (k, text) in self.status_text.iter().enumerate() {
+                if text.is_empty() {
                     continue;
                 }
-                let mut cell = RECT::default();
-                sm(
-                    self.tab,
-                    TCM_GETITEMRECT,
-                    i,
-                    &mut cell as *mut RECT as isize,
-                );
-                let saved = SaveDC(hdc);
-                let _ =
-                    IntersectClipRect(hdc, client.left, client.top, client.right, client.bottom);
-                let b = CreateSolidBrush(if selected { th.tab_sel } else { th.tab_hot });
-                if selected {
-                    // The control draws the selected item's frame edge outside
-                    // rcItem — flat-fill the whole cell band up to the strip
-                    // top first so no frame sliver survives.
-                    let mut cover = cell;
-                    cover.left -= scale(4, self.dpi);
-                    cover.right += scale(4, self.dpi);
-                    cover.top = client.top;
-                    FillRect(hdc, &cover, b);
+                let mut t = wide(text);
+                let n = t.len() - 1;
+                let w = text_extent(hdc, &t) + pad * 2;
+                let mut r = RECT {
+                    left: right - w,
+                    top: band.top + 1,
+                    right,
+                    bottom: band.bottom,
+                };
+                DrawTextW(hdc, &mut t[..n], &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                right -= w;
+                if k + 1 < self.status_text.len() {
+                    let inset = scale(6, self.dpi);
+                    let div = RECT {
+                        left: right,
+                        top: band.top + inset,
+                        right: right + 1,
+                        bottom: band.bottom - inset,
+                    };
+                    FillRect(hdc, &div, sep);
                 }
-                let mut pill = cell;
-                pill.left += scale(1, self.dpi);
-                pill.right -= scale(1, self.dpi);
-                if selected {
-                    pill.top = client.top;
-                }
-                pill.bottom += rad; // clipped — only the top corners stay round
-                let oldb = SelectObject(hdc, HGDIOBJ(b.0));
-                let np = SelectObject(hdc, GetStockObject(NULL_PEN));
-                let _ = RoundRect(
-                    hdc,
-                    pill.left,
-                    pill.top,
-                    pill.right,
-                    pill.bottom,
-                    rad * 2,
-                    rad * 2,
-                );
-                SelectObject(hdc, np);
-                SelectObject(hdc, oldb);
-                let _ = DeleteObject(HGDIOBJ(b.0));
-                let _ = RestoreDC(hdc, saved);
-                self.draw_tab_contents(hdc, i, &cell, selected);
             }
-        }
-    }
-
-    fn draw_status_part(&self, dis: &DRAWITEMSTRUCT) {
-        unsafe {
-            let bg = CreateSolidBrush(self.theme.chrome_bg);
-            FillRect(dis.hDC, &dis.rcItem, bg);
-            let _ = DeleteObject(HGDIOBJ(bg.0));
-            if dis.itemData == 0 {
-                return;
-            }
-            let ptr = dis.itemData as *const u16;
-            let mut len = 0usize;
-            while len < 96 && *ptr.add(len) != 0 {
-                len += 1;
-            }
-            if len == 0 {
-                return; // DrawTextW dereferences the buffer — never pass empty
-            }
-            let mut s = std::slice::from_raw_parts(ptr, len).to_vec();
-            let old = SelectObject(dis.hDC, HGDIOBJ(self.font.0));
-            SetBkMode(dis.hDC, TRANSPARENT);
-            SetTextColor(dis.hDC, self.theme.status_fg);
-            let mut rc = dis.rcItem;
-            DrawTextW(
-                dis.hDC,
-                &mut s,
-                &mut rc,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
-            SelectObject(dis.hDC, old);
+            SelectObject(hdc, old);
+            let _ = DeleteObject(HGDIOBJ(sep.0));
         }
     }
 
@@ -1712,6 +2079,15 @@ impl App {
                     if let Some(d) = menu_item_data(m, i) {
                         (*d).accel_col = max_w;
                         (*d).label_col = max_l;
+                        // Windows caches owner-drawn item sizes; touching
+                        // the type makes it send WM_MEASUREITEM again.
+                        let mii = MENUITEMINFOW {
+                            cbSize: size_of::<MENUITEMINFOW>() as u32,
+                            fMask: MIIM_FTYPE,
+                            fType: MFT_OWNERDRAW,
+                            ..Default::default()
+                        };
+                        let _ = SetMenuItemInfoW(m, i, true, &mii);
                     }
                 }
             }
@@ -1736,25 +2112,6 @@ impl App {
             let _ = GetClientRect(self.hwnd, &mut rc);
             rc.bottom = self.menu_h();
             let _ = InvalidateRect(Some(self.hwnd), Some(&rc), false);
-        }
-    }
-
-    fn on_strip_hover(&mut self, x: i32, y: i32) {
-        let hit = self.strip_hit(x, y).map(|i| i as i32).unwrap_or(-1);
-        if hit != self.menu_hot {
-            self.menu_hot = hit;
-            self.invalidate_strip();
-        }
-        if hit >= 0 {
-            unsafe {
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: self.hwnd,
-                    dwHoverTime: 0,
-                };
-                let _ = TrackMouseEvent(&mut tme);
-            }
         }
     }
 
@@ -1815,6 +2172,16 @@ impl App {
     fn paint_menu_strip(&self, hdc: HDC) {
         unsafe {
             let menu_h = self.menu_h();
+            // Fill the strip band itself — partial invalidates can't rely on
+            // WM_ERASEBKGND having run first.
+            let mut band = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut band);
+            band.bottom = menu_h;
+            let bb = CreateSolidBrush(self.theme.chrome_bg);
+            FillRect(hdc, &band, bb);
+            let _ = DeleteObject(HGDIOBJ(bb.0));
+
+            let aa = Aa::new(hdc);
             let old = SelectObject(hdc, HGDIOBJ(self.font.0));
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, self.theme.menu_fg);
@@ -1826,27 +2193,12 @@ impl App {
                     bottom: menu_h,
                 };
                 if i as i32 == self.menu_hot || i as i32 == self.menu_open {
-                    let rad = scale(4, self.dpi);
                     let mut pill = rc;
                     pill.top += scale(3, self.dpi);
                     pill.bottom -= scale(3, self.dpi);
                     pill.left += scale(1, self.dpi);
                     pill.right -= scale(1, self.dpi);
-                    let b = CreateSolidBrush(self.theme.menu_hover);
-                    let oldb = SelectObject(hdc, HGDIOBJ(b.0));
-                    let np = SelectObject(hdc, GetStockObject(NULL_PEN));
-                    let _ = RoundRect(
-                        hdc,
-                        pill.left,
-                        pill.top,
-                        pill.right,
-                        pill.bottom,
-                        rad * 2,
-                        rad * 2,
-                    );
-                    SelectObject(hdc, np);
-                    SelectObject(hdc, oldb);
-                    let _ = DeleteObject(HGDIOBJ(b.0));
+                    aa.fill_rounded(&pill, scale(4, self.dpi), false, self.theme.menu_hover);
                 }
                 let mut label = e.label.clone();
                 let n = label.len().saturating_sub(1);
@@ -1912,31 +2264,17 @@ impl App {
                 return;
             }
             let d = &*d;
+            let aa = Aa::new(dis.hDC);
             let selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
             let grayed = (dis.itemState.0 & (ODS_GRAYED.0 | ODS_DISABLED.0)) != 0;
             if selected && !grayed {
                 // Rounded hover pill, inset a few px from the popup edge.
-                let rad = scale(4, self.dpi);
                 let mut pill = dis.rcItem;
                 pill.left += scale(3, self.dpi);
                 pill.right -= scale(3, self.dpi);
                 pill.top += 1;
                 pill.bottom -= 1;
-                let b = CreateSolidBrush(th.menu_hover);
-                let oldb = SelectObject(dis.hDC, HGDIOBJ(b.0));
-                let np = SelectObject(dis.hDC, GetStockObject(NULL_PEN));
-                let _ = RoundRect(
-                    dis.hDC,
-                    pill.left,
-                    pill.top,
-                    pill.right,
-                    pill.bottom,
-                    rad * 2,
-                    rad * 2,
-                );
-                SelectObject(dis.hDC, np);
-                SelectObject(dis.hDC, oldb);
-                let _ = DeleteObject(HGDIOBJ(b.0));
+                aa.fill_rounded(&pill, scale(4, self.dpi), false, th.menu_hover);
             }
             let fg = if grayed { th.menu_dim } else { th.menu_fg };
             let old = SelectObject(dis.hDC, HGDIOBJ(self.font.0));
@@ -1952,9 +2290,9 @@ impl App {
                     bottom: dis.rcItem.bottom,
                 };
                 if d.radio {
-                    draw_radio_glyph(dis.hDC, &rc, fg, self.dpi);
+                    draw_radio_glyph(&aa, &rc, fg, self.dpi);
                 } else {
-                    draw_check_glyph(dis.hDC, &rc, fg, self.dpi);
+                    draw_check_glyph(&aa, &rc, fg, self.dpi);
                 }
             }
             let mut rc = dis.rcItem;
@@ -1976,7 +2314,7 @@ impl App {
             let mut rrc = dis.rcItem;
             if d.submenu {
                 rrc.left = accel_x;
-                draw_chevron_glyph(dis.hDC, &rrc, th.menu_dim, self.dpi);
+                draw_chevron_glyph(&aa, &rrc, th.menu_dim, self.dpi);
             } else if d.accel.len() > 1 {
                 let mut accel = d.accel.clone();
                 let n = accel.len().saturating_sub(1);
@@ -1994,45 +2332,223 @@ impl App {
         }
     }
 
-    /// The "+" new-tab glyph sits right after the last tab, drawn inside the
-    /// strip's empty area — same hit-test region used by tab_proc's clicks.
-    fn plus_rect(&self) -> RECT {
-        let side = scale(22, self.dpi);
-        let top = (scale(32, self.dpi) - side) / 2;
-        let count = sm(self.tab, TCM_GETITEMCOUNT, 0, 0).0.max(0);
-        let mut left = scale(4, self.dpi);
-        if count > 0 {
-            let mut ir = RECT::default();
-            sm(
-                self.tab,
-                TCM_GETITEMRECT,
-                (count - 1) as usize,
-                &mut ir as *mut RECT as isize,
-            );
-            left = ir.right + scale(4, self.dpi);
+    /// The "+" new-tab button right after the last tab.
+    fn draw_plus(&self, aa: &Aa) {
+        let rc = self.plus_rect();
+        if self.plus_hot {
+            aa.fill_ellipse(&rc, self.theme.tab_hot);
         }
-        RECT {
-            left,
-            top,
-            right: left + side,
-            bottom: top + side,
+        draw_plus_glyph(aa, &rc, self.theme.tab_fg, self.dpi);
+    }
+
+    // ---- find / replace / go to -------------------------------------------
+
+    /// Current selection as a search seed: single line, short, non-empty.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let edit = self.active_edit()?;
+        let sel = get_sel(edit);
+        let n = sel.cpMax - sel.cpMin;
+        if n <= 0 || n > 256 {
+            return None;
+        }
+        let text = get_range(edit, sel.cpMin, sel.cpMax);
+        if text.iter().any(|&c| c == 13 || c == 10) {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&text))
+    }
+
+    /// F3 / Shift+F3 / Enter in the find bar. Wraps around once.
+    pub(crate) fn find_next(&mut self, forward: bool) {
+        let q = findbar::query(self);
+        if q.len() <= 1 {
+            findbar::open(self, BarMode::Find);
+            return;
+        }
+        self.find_query = q.clone();
+        let Some(edit) = self.active_edit() else { return };
+        let sel = get_sel(edit);
+        let hit = if forward {
+            find_range(edit, &q, sel.cpMax, -1, true).or_else(|| find_range(edit, &q, 0, -1, true))
+        } else {
+            find_range(edit, &q, sel.cpMin, 0, false)
+                .or_else(|| find_range(edit, &q, text_len(edit), 0, false))
+        };
+        self.show_hit(edit, hit);
+    }
+
+    /// Find-as-you-type: re-search from the start of the current match so
+    /// extending the query keeps the same hit selected.
+    pub(crate) fn find_incremental(&mut self) {
+        let q = findbar::query(self);
+        let Some(edit) = self.active_edit() else { return };
+        if q.len() <= 1 {
+            findbar::set_note(self, "", false);
+            return;
+        }
+        let from = get_sel(edit).cpMin;
+        let hit =
+            find_range(edit, &q, from, -1, true).or_else(|| find_range(edit, &q, 0, -1, true));
+        self.show_hit(edit, hit);
+    }
+
+    fn show_hit(&mut self, edit: HWND, hit: Option<CHARRANGE>) {
+        match hit {
+            Some(r) => {
+                set_sel(edit, r.cpMin, r.cpMax);
+                sm(edit, EM_SCROLLCARET, 0, 0);
+                findbar::set_note(self, "", false);
+            }
+            None => findbar::set_note(self, "No results", true),
+        }
+        self.invalidate_gutter();
+    }
+
+    /// Replaces the selection if it is a match, then moves to the next one.
+    pub(crate) fn replace_next(&mut self) {
+        let q = findbar::query(self);
+        let Some(edit) = self.active_edit().filter(|_| q.len() > 1) else {
+            return;
+        };
+        let sel = get_sel(edit);
+        if sel.cpMax > sel.cpMin && find_range(edit, &q, sel.cpMin, sel.cpMax, true) == Some(sel) {
+            let rep = findbar::repl_text(self);
+            sm(edit, EM_REPLACESEL, 1, rep.as_ptr() as isize);
+        }
+        self.find_next(true);
+    }
+
+    /// Replaces every match in one edit, so a single Undo reverts it all.
+    pub(crate) fn replace_all(&mut self) {
+        let q = findbar::query(self);
+        let Some(edit) = self.active_edit().filter(|_| q.len() > 1) else {
+            return;
+        };
+        let mut hits = Vec::new();
+        let mut pos = 0;
+        while let Some(r) = find_range(edit, &q, pos, -1, true) {
+            if r.cpMax <= r.cpMin {
+                break;
+            }
+            hits.push(r);
+            pos = r.cpMax;
+        }
+        if hits.is_empty() {
+            findbar::set_note(self, "No results", true);
+            return;
+        }
+        let rep = findbar::repl_text(self);
+        let rep = &rep[..rep.len() - 1];
+        let text = get_text_raw(edit);
+        if text.len() as i32 != text_len(edit) {
+            // Offsets don't line up with the plain text (embedded objects
+            // from a rich paste) — replace match by match, last first.
+            for r in hits.iter().rev() {
+                set_sel(edit, r.cpMin, r.cpMax);
+                let mut w = rep.to_vec();
+                w.push(0);
+                sm(edit, EM_REPLACESEL, 1, w.as_ptr() as isize);
+            }
+        } else {
+            // Rewrite only the span from the first match to the last, so
+            // Undo restores (and selects) as little as possible.
+            let span_start = hits[0].cpMin;
+            let span_end = hits[hits.len() - 1].cpMax;
+            let mut out = Vec::new();
+            let mut last = span_start as usize;
+            for r in &hits {
+                out.extend_from_slice(&text[last..r.cpMin as usize]);
+                out.extend_from_slice(rep);
+                last = r.cpMax as usize;
+            }
+            out.push(0);
+            let caret = get_sel(edit).cpMin;
+            let mut scroll = POINT::default();
+            sm(edit, EM_GETSCROLLPOS, 0, &mut scroll as *mut POINT as isize);
+            sm(edit, WM_SETREDRAW, 0, 0);
+            set_sel(edit, span_start, span_end);
+            sm(edit, EM_REPLACESEL, 1, out.as_ptr() as isize);
+            let c = caret.min(text_len(edit));
+            set_sel(edit, c, c);
+            sm(edit, EM_SETSCROLLPOS, 0, &mut scroll as *mut POINT as isize);
+            sm(edit, WM_SETREDRAW, 1, 0);
+            unsafe {
+                let _ = InvalidateRect(Some(edit), None, true);
+            }
+        }
+        let n = hits.len();
+        findbar::set_note(self, &format!("{n} replaced"), false);
+        self.invalidate_gutter();
+    }
+
+    /// Enter in the bar's Go To mode: jump to the typed line number.
+    pub(crate) fn goto_from_bar(&mut self) {
+        let q = findbar::query(self);
+        let typed = String::from_utf16_lossy(&q[..q.len().saturating_sub(1)]);
+        let Some(i) = self.active else { return };
+        let Ok(n) = typed.trim().parse::<usize>() else {
+            findbar::set_note(self, "Type a line number", true);
+            return;
+        };
+        let count = self.line_starts(i).len();
+        let cp = self.line_starts(i)[n.clamp(1, count) - 1];
+        let edit = self.docs[i].edit;
+        set_sel(edit, cp, cp);
+        sm(edit, EM_SCROLLCARET, 0, 0);
+        self.close_findbar();
+    }
+
+    pub(crate) fn close_findbar(&mut self) {
+        findbar::close(self);
+        if let Some(e) = self.active_edit() {
+            unsafe {
+                let _ = SetFocus(Some(e));
+            }
         }
     }
 
-    fn draw_plus(&self, hdc: HDC) {
-        unsafe {
-            let rc = self.plus_rect();
-            if self.plus_hot {
-                let b = CreateSolidBrush(self.theme.tab_hot);
-                let oldb = SelectObject(hdc, HGDIOBJ(b.0));
-                let np = SelectObject(hdc, GetStockObject(NULL_PEN));
-                let _ = Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
-                SelectObject(hdc, np);
-                SelectObject(hdc, oldb);
-                let _ = DeleteObject(HGDIOBJ(b.0));
-            }
-            draw_plus_glyph(hdc, &rc, self.theme.tab_fg, self.dpi);
+    /// Ctrl+D: copies the line(s) touched by the selection below
+    /// themselves and moves the selection onto the copy.
+    fn duplicate_line(&mut self) {
+        let Some(i) = self.active else { return };
+        let edit = self.docs[i].edit;
+        let sel = get_sel(edit);
+        let (first, start) = self.line_at(i, sel.cpMin);
+        // A selection ending at a line start doesn't include that line.
+        let last_cp = if sel.cpMax > sel.cpMin { sel.cpMax - 1 } else { sel.cpMax };
+        let last = self.line_at(i, last_cp).0.max(first);
+        let end = self.line_end(i, last);
+        let mut ins = vec![13u16];
+        ins.extend(get_range(edit, start, end));
+        ins.push(0);
+        set_sel(edit, end, end);
+        sm(edit, EM_REPLACESEL, 1, ins.as_ptr() as isize);
+        let shift = end - start + 1;
+        set_sel(edit, sel.cpMin + shift, sel.cpMax + shift);
+        sm(edit, EM_SCROLLCARET, 0, 0);
+    }
+
+    /// Enter with auto-indent on: carry the current line's leading
+    /// whitespace onto the new line. Returns false to let RichEdit handle
+    /// a plain Enter.
+    fn auto_indent_newline(&mut self, edit: HWND) -> bool {
+        let Some(i) = self.docs.iter().position(|d| d.edit.0 == edit.0) else {
+            return false;
+        };
+        let sel = get_sel(edit);
+        let (_, start) = self.line_at(i, sel.cpMin);
+        let indent: Vec<u16> = get_range(edit, start, sel.cpMin)
+            .into_iter()
+            .take_while(|&c| c == b' ' as u16 || c == b'\t' as u16)
+            .collect();
+        if indent.is_empty() {
+            return false;
         }
+        let mut ins = vec![13u16];
+        ins.extend(indent);
+        ins.push(0);
+        sm(edit, EM_REPLACESEL, 1, ins.as_ptr() as isize);
+        true
     }
 
     // ---- files -----------------------------------------------------------
@@ -2053,7 +2569,25 @@ impl App {
             self.set_active(i);
             return;
         }
+        // A lone untouched "Untitled" tab (the one every window starts
+        // with) gives way to the file instead of lingering beside it.
+        let blank = (self.docs.len() == 1
+            && self.docs[0].path.is_none()
+            && text_len(self.docs[0].edit) == 0
+            && sm(self.docs[0].edit, EM_GETMODIFY, 0, 0).0 == 0)
+            .then(|| self.docs[0].edit);
+        let before = self.docs.len();
         self.new_document(Some(canon));
+        if let Some(edit) = blank.filter(|_| self.docs.len() > before) {
+            unsafe {
+                let _ = RemoveWindowSubclass(edit, Some(edit_proc), EDIT_SUBCLASS);
+                let _ = DestroyWindow(edit);
+            }
+            self.docs.remove(0);
+            self.active = Some(self.docs.len() - 1);
+            self.layout();
+            self.invalidate_tabs();
+        }
     }
 
     fn confirm_save(&mut self, i: usize) -> bool {
@@ -2228,11 +2762,15 @@ fn ui_font(dpi: u32, face: &str) -> HFONT {
     }
 }
 
-fn set_editor_font(edit: HWND, face: &str) {
+/// Applies the editor face and size. Like apply_editor_theme, this keeps the
+/// modified flag and mutes EN_CHANGE so a font change never dirties a tab.
+fn set_editor_font(edit: HWND, face: &str, pt: i32) {
+    let was_modified = sm(edit, EM_GETMODIFY, 0, 0).0;
+    sm(edit, EM_SETEVENTMASK, 0, 0);
     let mut cf = CHARFORMAT2W::default();
     cf.Base.cbSize = size_of::<CHARFORMAT2W>() as u32;
     cf.Base.dwMask = CFM_FACE | CFM_SIZE | CFM_CHARSET;
-    cf.Base.yHeight = 220; // 11pt, in twips
+    cf.Base.yHeight = pt * 20; // twips
     cf.Base.bCharSet = DEFAULT_CHARSET;
     let face = wide(face);
     let n = (face.len() - 1).min(31);
@@ -2243,6 +2781,8 @@ fn set_editor_font(edit: HWND, face: &str) {
         SCF_ALL as usize,
         &cf as *const _ as isize,
     );
+    sm(edit, EM_SETMODIFY, was_modified as usize, 0);
+    sm(edit, EM_SETEVENTMASK, 0, EDIT_EVENTS as isize);
 }
 
 /// Recolors an editor control for the active theme. Preserves the modified
@@ -2263,12 +2803,7 @@ fn apply_editor_theme(edit: HWND, th: &Theme) {
         &cf as *const _ as isize,
     );
     sm(edit, EM_SETMODIFY, was_modified as usize, 0);
-    sm(
-        edit,
-        EM_SETEVENTMASK,
-        0,
-        (ENM_CHANGE | ENM_SELCHANGE) as isize,
-    );
+    sm(edit, EM_SETEVENTMASK, 0, EDIT_EVENTS as isize);
     theme::set_control_dark(edit, th.dark);
 }
 
@@ -2325,6 +2860,100 @@ fn get_text(edit: HWND) -> Vec<u16> {
     buf
 }
 
+/// Editor text without CRLF translation — offsets match RichEdit's char
+/// positions one-to-one (line breaks are a single CR).
+fn get_text_raw(edit: HWND) -> Vec<u16> {
+    let len = text_len(edit).max(0) as usize;
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u16; len + 1];
+    let mut gt = GETTEXTEX {
+        cb: (buf.len() * 2) as u32,
+        flags: GT_DEFAULT,
+        codepage: CP_UTF16,
+        ..Default::default()
+    };
+    let n = sm(
+        edit,
+        EM_GETTEXTEX,
+        &mut gt as *mut GETTEXTEX as usize,
+        buf.as_mut_ptr() as isize,
+    )
+    .0 as usize;
+    buf.truncate(n.min(len));
+    buf
+}
+
+/// Character count in RichEdit's own units (CR line breaks).
+fn text_len(edit: HWND) -> i32 {
+    let mut gtl = GETTEXTLENGTHEX {
+        flags: GTL_NUMCHARS | GTL_PRECISE,
+        codepage: CP_UTF16,
+    };
+    sm(
+        edit,
+        EM_GETTEXTLENGTHEX,
+        &mut gtl as *mut GETTEXTLENGTHEX as usize,
+        0,
+    )
+    .0 as i32
+}
+
+fn get_sel(edit: HWND) -> CHARRANGE {
+    let mut r = CHARRANGE::default();
+    sm(edit, EM_EXGETSEL, 0, &mut r as *mut CHARRANGE as isize);
+    r
+}
+
+fn set_sel(edit: HWND, from: i32, to: i32) {
+    let mut r = CHARRANGE {
+        cpMin: from,
+        cpMax: to,
+    };
+    sm(edit, EM_EXSETSEL, 0, &mut r as *mut CHARRANGE as isize);
+}
+
+/// Text in [from, to) as UTF-16, no terminator.
+fn get_range(edit: HWND, from: i32, to: i32) -> Vec<u16> {
+    if to <= from {
+        return Vec::new();
+    }
+    let mut buf = vec![0u16; (to - from) as usize + 1];
+    let mut tr = TEXTRANGEW {
+        chrg: CHARRANGE {
+            cpMin: from,
+            cpMax: to,
+        },
+        lpstrText: PWSTR(buf.as_mut_ptr()),
+    };
+    let n = sm(edit, EM_GETTEXTRANGE, 0, &mut tr as *mut TEXTRANGEW as isize).0;
+    buf.truncate(n.max(0) as usize);
+    buf
+}
+
+/// Case-insensitive RichEdit search for null-terminated `q` from `from`
+/// toward `to` (backward when `forward` is false; `to` = -1 is the end).
+fn find_range(edit: HWND, q: &[u16], from: i32, to: i32, forward: bool) -> Option<CHARRANGE> {
+    let mut ft = FINDTEXTEXW {
+        chrg: CHARRANGE {
+            cpMin: from,
+            cpMax: to,
+        },
+        lpstrText: PCWSTR(q.as_ptr()),
+        chrgText: CHARRANGE::default(),
+    };
+    let flags = if forward { FR_DOWN.0 } else { 0 };
+    let r = sm(
+        edit,
+        EM_FINDTEXTEXW,
+        flags as usize,
+        &mut ft as *mut FINDTEXTEXW as isize,
+    )
+    .0;
+    if r >= 0 { Some(ft.chrgText) } else { None }
+}
+
 fn file_dialog(owner: HWND, open: bool, initial: Option<&str>) -> Option<PathBuf> {
     unsafe {
         let mut buf = vec![0u16; 32768];
@@ -2367,392 +2996,74 @@ fn file_dialog(owner: HWND, open: bool, initial: Option<&str>) -> Option<PathBuf
 // ---- subclasses ------------------------------------------------------------
 
 /// Tab strip: middle-click closes a tab, double-click on empty space opens one.
-unsafe extern "system" fn tab_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _id: usize,
-    refdata: usize,
-) -> LRESULT {
-    unsafe {
-        match msg {
-            // Fill the strip background in the theme color; the control's own
-            // erase would otherwise paint the default face color.
-            WM_ERASEBKGND => {
-                let parent = HWND(refdata as *mut c_void);
-                let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-                if app.is_null() {
-                    return DefSubclassProc(hwnd, msg, wparam, lparam);
-                }
-                let mut rc = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rc);
-                let b = CreateSolidBrush((*app).theme.chrome_bg);
-                FillRect(HDC(wparam.0 as *mut c_void), &rc, b);
-                let _ = DeleteObject(HGDIOBJ(b.0));
-                LRESULT(1)
-            }
-            m if m == WM_PAINT || m == WM_PRINT || m == WM_PRINTCLIENT => {
-                let r = DefSubclassProc(hwnd, msg, wparam, lparam);
-                let parent = HWND(refdata as *mut c_void);
-                let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-                if !app.is_null() {
-                    let a = &*app;
-                    // WM_PRINT/WM_PRINTCLIENT supply a DC; WM_PAINT needs GetDC.
-                    let hdc = if msg == WM_PAINT {
-                        GetDC(Some(hwnd))
-                    } else {
-                        HDC(wparam.0 as *mut c_void)
-                    };
-                    let mut rc = RECT::default();
-                    let _ = GetClientRect(hwnd, &mut rc);
-                    let b = CreateSolidBrush(a.theme.chrome_bg);
-                    // Empty strip to the right of the last tab
-                    let count = sm(hwnd, TCM_GETITEMCOUNT, 0, 0).0 as i32;
-                    if count > 0 {
-                        let mut ir = RECT::default();
-                        sm(
-                            hwnd,
-                            TCM_GETITEMRECT,
-                            (count - 1) as usize,
-                            &mut ir as *mut RECT as isize,
-                        );
-                        if ir.right < rc.right {
-                            let mut gap = rc;
-                            gap.left = ir.right;
-                            FillRect(hdc, &gap, b);
-                        }
-                    }
-                    // Cover the default 3D edge under the tabs.
-                    let mut edge = rc;
-                    edge.top = edge.bottom - scale(2, a.dpi).max(1);
-                    FillRect(hdc, &edge, b);
-                    let _ = DeleteObject(HGDIOBJ(b.0));
-                    // Pills + contents over the full cells (covers the control's
-                    // frame edge around the selected tab).
-                    a.draw_tabs(hdc);
-                    a.draw_plus(hdc);
-                    if msg == WM_PAINT {
-                        let _ = ReleaseDC(Some(hwnd), hdc);
-                    }
-                }
-                r
-            }
-            WM_MOUSEMOVE => {
-                let parent = HWND(refdata as *mut c_void);
-                let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-                if !app.is_null() {
-                    let a = &mut *app;
-                    let (x, y) = (x_lparam(lparam), y_lparam(lparam));
-                    let now = pt_in_rect(&a.plus_rect(), x, y);
-                    if now != a.plus_hot {
-                        a.plus_hot = now;
-                        let rc = a.plus_rect();
-                        let _ = InvalidateRect(Some(hwnd), Some(&rc), false);
-                    }
-                    // Track which tab / close button is under the cursor.
-                    let ti = a.tab_hit(hwnd, x, y).map(|t| t as i32).unwrap_or(-1);
-                    let ci = a.tab_close_hit(hwnd, x, y).map(|t| t as i32).unwrap_or(-1);
-                    if ti != a.tab_hot || ci != a.close_hot {
-                        let old_t = a.tab_hot;
-                        let old_c = a.close_hot;
-                        a.tab_hot = ti;
-                        a.close_hot = ci;
-                        for i in [old_t, ti, old_c, ci] {
-                            if i >= 0 {
-                                let mut ir = RECT::default();
-                                sm(
-                                    hwnd,
-                                    TCM_GETITEMRECT,
-                                    i as usize,
-                                    &mut ir as *mut RECT as isize,
-                                );
-                                let _ = InvalidateRect(Some(hwnd), Some(&ir), false);
-                            }
-                        }
-                    }
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut tme);
-                }
-                DefSubclassProc(hwnd, msg, wparam, lparam)
-            }
-            WM_MOUSELEAVE => {
-                let parent = HWND(refdata as *mut c_void);
-                let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-                if !app.is_null() {
-                    let a = &mut *app;
-                    let stale = [a.tab_hot, a.close_hot];
-                    a.plus_hot = false;
-                    a.tab_hot = -1;
-                    a.close_hot = -1;
-                    let rc = a.plus_rect();
-                    let _ = InvalidateRect(Some(hwnd), Some(&rc), false);
-                    for i in stale {
-                        if i >= 0 {
-                            let mut ir = RECT::default();
-                            sm(
-                                hwnd,
-                                TCM_GETITEMRECT,
-                                i as usize,
-                                &mut ir as *mut RECT as isize,
-                            );
-                            let _ = InvalidateRect(Some(hwnd), Some(&ir), false);
-                        }
-                    }
-                }
-                DefSubclassProc(hwnd, msg, wparam, lparam)
-            }
-            WM_LBUTTONDOWN => {
-                // Swallow presses on a tab's close button so the click doesn't
-                // also select the tab underneath.
-                let parent = HWND(refdata as *mut c_void);
-                let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-                if !app.is_null()
-                    && (*app)
-                        .tab_close_hit(hwnd, x_lparam(lparam), y_lparam(lparam))
-                        .is_some()
-                {
-                    return LRESULT(0);
-                }
-                DefSubclassProc(hwnd, msg, wparam, lparam)
-            }
-            WM_LBUTTONUP => {
-                let parent = HWND(refdata as *mut c_void);
-                let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-                if !app.is_null() {
-                    let a = &*app;
-                    let (x, y) = (x_lparam(lparam), y_lparam(lparam));
-                    if pt_in_rect(&a.plus_rect(), x, y) {
-                        (*app).new_document(None);
-                        return LRESULT(0);
-                    }
-                    if let Some(i) = a.tab_close_hit(hwnd, x, y) {
-                        (*app).close_tab(i);
-                        return LRESULT(0);
-                    }
-                }
-                DefSubclassProc(hwnd, msg, wparam, lparam)
-            }
-            // Empty tab-strip space is a drag handle for the window. The control
-            // reports HTTRANSPARENT there (routing clicks to the parent), so test
-            // the point against the client rect ourselves: tabs and the plus
-            // button stay client hits, the rest becomes caption for dragging.
-            WM_NCHITTEST => {
-                let r = DefSubclassProc(hwnd, msg, wparam, lparam);
-                let parent = HWND(refdata as *mut c_void);
-                let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-                if app.is_null() {
-                    return r;
-                }
-                let a = &*app;
-                let mut p = POINT {
-                    x: x_lparam(lparam),
-                    y: y_lparam(lparam),
-                };
-                let _ = ScreenToClient(hwnd, &mut p);
-                let mut rc = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rc);
-                if !pt_in_rect(&rc, p.x, p.y) {
-                    return r;
-                }
-                if a.tab_hit(hwnd, p.x, p.y).is_some() || pt_in_rect(&a.plus_rect(), p.x, p.y) {
-                    LRESULT(HTCLIENT as isize)
-                } else {
-                    LRESULT(HTCAPTION as isize)
-                }
-            }
-            WM_MBUTTONUP | WM_LBUTTONDBLCLK => {
-                let r = DefSubclassProc(hwnd, msg, wparam, lparam);
-                let parent = HWND(refdata as *mut c_void);
-                let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-                if !app.is_null() {
-                    let mut ht = TCHITTESTINFO {
-                        pt: POINT {
-                            x: x_lparam(lparam),
-                            y: y_lparam(lparam),
-                        },
-                        ..Default::default()
-                    };
-                    let idx = SendMessageW(
-                        hwnd,
-                        TCM_HITTEST,
-                        Some(WPARAM(0)),
-                        Some(LPARAM(&mut ht as *mut TCHITTESTINFO as isize)),
-                    )
-                    .0;
-                    if msg == WM_MBUTTONUP {
-                        if idx >= 0 {
-                            (*app).close_tab(idx as usize);
-                        }
-                    } else if idx < 0 {
-                        (*app).new_document(None);
-                    }
-                }
-                r
-            }
-            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
-        }
-    }
-}
-
 // ---- vector glyphs ---------------------------------------------------------
-// Chrome icons are drawn with pens, not fonts — crisp at any DPI and immune
-// to missing icon fonts.
+// Chrome icons are drawn through GDI+ (Aa) — anti-aliased, crisp at any DPI,
+// and immune to missing icon fonts.
 
-/// Selects a fresh round-cap pen and returns the previous object. Caller must
-/// `glyph_end` to restore and free it.
-fn glyph_begin(hdc: HDC, color: COLORREF, dpi: u32) -> (HPEN, HGDIOBJ) {
-    unsafe {
-        let lb = LOGBRUSH {
-            lbStyle: BS_SOLID,
-            lbColor: color,
-            ..Default::default()
-        };
-        let pen = ExtCreatePen(
-            PEN_STYLE(PS_COSMETIC.0 | PS_ENDCAP_ROUND.0 | PS_JOIN_ROUND.0),
-            scale(1, dpi).max(1) as u32 + 1,
-            &lb,
-            None,
-        );
-        let old = SelectObject(hdc, HGDIOBJ(pen.0));
-        (pen, old)
-    }
-}
-
-fn glyph_end(hdc: HDC, pen: HPEN, old: HGDIOBJ) {
-    unsafe {
-        SelectObject(hdc, old);
-        let _ = DeleteObject(HGDIOBJ(pen.0));
-    }
-}
-
-fn line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
-    unsafe {
-        let _ = MoveToEx(hdc, x1, y1, None);
-        let _ = LineTo(hdc, x2, y2);
-    }
-}
-
-fn draw_plus_glyph(hdc: HDC, rc: &RECT, color: COLORREF, dpi: u32) {
-    let (pen, old) = glyph_begin(hdc, color, dpi);
+fn draw_plus_glyph(aa: &Aa, rc: &RECT, color: COLORREF, dpi: u32) {
     let cx = (rc.left + rc.right) / 2;
     let cy = (rc.top + rc.bottom) / 2;
     let half = (rc.right - rc.left) * 7 / 22;
-    line(hdc, cx - half, cy, cx + half + 1, cy);
-    line(hdc, cx, cy - half, cx, cy + half + 1);
-    glyph_end(hdc, pen, old);
+    let w = scale(1, dpi).max(1) as f32;
+    aa.stroke(&[(cx - half, cy), (cx + half, cy)], color, w);
+    aa.stroke(&[(cx, cy - half), (cx, cy + half)], color, w);
 }
 
-fn draw_close_glyph(hdc: HDC, rc: &RECT, color: COLORREF, dpi: u32) {
-    let (pen, old) = glyph_begin(hdc, color, dpi);
+pub(crate) fn draw_close_glyph(aa: &Aa, rc: &RECT, color: COLORREF, dpi: u32) {
     let cx = (rc.left + rc.right) / 2;
     let cy = (rc.top + rc.bottom) / 2;
     let half = (rc.right - rc.left) * 5 / 18;
-    line(hdc, cx - half, cy - half, cx + half + 1, cy + half + 1);
-    line(hdc, cx + half, cy - half, cx - half - 1, cy + half + 1);
-    glyph_end(hdc, pen, old);
+    let w = scale(1, dpi).max(1) as f32;
+    aa.stroke(&[(cx - half, cy - half), (cx + half, cy + half)], color, w);
+    aa.stroke(&[(cx + half, cy - half), (cx - half, cy + half)], color, w);
 }
 
-fn draw_check_glyph(hdc: HDC, rc: &RECT, color: COLORREF, dpi: u32) {
-    let (pen, old) = glyph_begin(hdc, color, dpi);
+fn draw_check_glyph(aa: &Aa, rc: &RECT, color: COLORREF, dpi: u32) {
     let w = rc.right - rc.left;
     let h = rc.bottom - rc.top;
-    let pts = [
-        POINT {
-            x: rc.left + w * 7 / 24,
-            y: rc.top + h * 12 / 24,
-        },
-        POINT {
-            x: rc.left + w * 11 / 24,
-            y: rc.top + h * 16 / 24,
-        },
-        POINT {
-            x: rc.left + w * 18 / 24,
-            y: rc.top + h * 7 / 24,
-        },
-    ];
-    unsafe {
-        let _ = Polyline(hdc, &pts);
-    }
-    glyph_end(hdc, pen, old);
+    aa.stroke(
+        &[
+            (rc.left + w * 7 / 24, rc.top + h * 12 / 24),
+            (rc.left + w * 11 / 24, rc.top + h * 16 / 24),
+            (rc.left + w * 18 / 24, rc.top + h * 7 / 24),
+        ],
+        color,
+        (scale(1, dpi).max(1) + 1) as f32,
+    );
 }
 
-fn draw_radio_glyph(hdc: HDC, rc: &RECT, color: COLORREF, _dpi: u32) {
-    unsafe {
-        let r = ((rc.right - rc.left) / 8).max(3);
-        let cx = (rc.left + rc.right) / 2;
-        let cy = (rc.top + rc.bottom) / 2;
-        let b = CreateSolidBrush(color);
-        let oldb = SelectObject(hdc, HGDIOBJ(b.0));
-        let np = SelectObject(hdc, GetStockObject(NULL_PEN));
-        let _ = Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-        SelectObject(hdc, np);
-        SelectObject(hdc, oldb);
-        let _ = DeleteObject(HGDIOBJ(b.0));
-    }
+fn draw_radio_glyph(aa: &Aa, rc: &RECT, color: COLORREF, _dpi: u32) {
+    let r = ((rc.right - rc.left) / 8).max(3);
+    let cx = (rc.left + rc.right) / 2;
+    let cy = (rc.top + rc.bottom) / 2;
+    aa.fill_ellipse(
+        &RECT {
+            left: cx - r,
+            top: cy - r,
+            right: cx + r,
+            bottom: cy + r,
+        },
+        color,
+    );
 }
 
-fn draw_chevron_glyph(hdc: HDC, rc: &RECT, color: COLORREF, dpi: u32) {
-    let (pen, old) = glyph_begin(hdc, color, dpi);
+fn draw_chevron_glyph(aa: &Aa, rc: &RECT, color: COLORREF, dpi: u32) {
     let h = rc.bottom - rc.top;
     let cx = rc.right - scale(6, dpi);
     let cy = (rc.top + rc.bottom) / 2;
-    let pts = [
-        POINT {
-            x: cx - 2,
-            y: cy - h * 3 / 16,
-        },
-        POINT { x: cx + 2, y: cy },
-        POINT {
-            x: cx - 2,
-            y: cy + h * 3 / 16,
-        },
-    ];
-    unsafe {
-        let _ = Polyline(hdc, &pts);
-    }
-    glyph_end(hdc, pen, old);
+    aa.stroke(
+        &[(cx - 2, cy - h * 3 / 16), (cx + 2, cy), (cx - 2, cy + h * 3 / 16)],
+        color,
+        scale(1, dpi).max(1) as f32,
+    );
 }
 
 // ---- subclasses ------------------------------------------------------------
 
-/// Status bar: flat hairline on top instead of the default 3D edge.
-unsafe extern "system" fn status_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _id: usize,
-    refdata: usize,
-) -> LRESULT {
-    unsafe {
-        if msg == WM_PAINT {
-            let r = DefSubclassProc(hwnd, msg, wparam, lparam);
-            let parent = HWND(refdata as *mut c_void);
-            let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-            if !app.is_null() {
-                let hdc = GetDC(Some(hwnd));
-                let mut rc = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rc);
-                rc.bottom = rc.top + 1;
-                let b = CreateSolidBrush((*app).theme.menu_sep);
-                FillRect(hdc, &rc, b);
-                let _ = DeleteObject(HGDIOBJ(b.0));
-                let _ = ReleaseDC(Some(hwnd), hdc);
-            }
-            return r;
-        }
-        DefSubclassProc(hwnd, msg, wparam, lparam)
-    }
-}
-
-/// CBT hook active while a TrackPopupMenuEx popup is open: rounds the
-/// corners of each menu window ("#32768") it sees being created or activated.
+/// CBT hook active while a TrackPopupMenuEx popup is open: subclasses each
+/// menu window ("#32768") so its frame is themed. Corner rounding is left to
+/// DWM (Windows 11 draws popups rounded natively) — SetWindowRgn would clip
+/// with visibly jagged stair-steps.
 unsafe extern "system" fn menu_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if code == HCBT_CREATEWND as i32 || code == HCBT_ACTIVATE as i32 {
@@ -2771,9 +3082,6 @@ unsafe extern "system" fn menu_hook_proc(code: i32, wparam: WPARAM, lparam: LPAR
                     ]
             {
                 theme::round_corners(hwnd);
-                // The popup keeps getting resized while TPM lays it out, so
-                // the rounded region has to follow its size — subclass it and
-                // re-apply on WM_WINDOWPOSCHANGED once the layout settles.
                 let _ = SetWindowSubclass(hwnd, Some(popup_proc), POPUP_SUBCLASS, 0);
             }
         }
@@ -2781,8 +3089,9 @@ unsafe extern "system" fn menu_hook_proc(code: i32, wparam: WPARAM, lparam: LPAR
     }
 }
 
-/// Popup menu window: keep a rounded window region matched to the live size
-/// (applied after TPM finishes layout, not at create time).
+/// Popup menu window: the system frames popups in a bright white that clashes
+/// with dark themes. Paint the non-client frame with the menu's border color
+/// so popups match their owner-drawn items.
 unsafe extern "system" fn popup_proc(
     hwnd: HWND,
     msg: u32,
@@ -2792,53 +3101,44 @@ unsafe extern "system" fn popup_proc(
     _refdata: usize,
 ) -> LRESULT {
     unsafe {
-        if msg == WM_WINDOWPOSCHANGED {
+        if msg == WM_NCPAINT {
             let r = DefSubclassProc(hwnd, msg, wparam, lparam);
-            // SetWindowRgn re-triggers WM_WINDOWPOSCHANGED — only rebuild the
-            // region when the size actually changed.
-            let wp = &*(lparam.0 as *const WINDOWPOS);
-            if (wp.flags & SWP_NOSIZE) == SWP_NOSIZE {
-                return r;
-            }
-            let (w, h) = (wp.cx, wp.cy);
-            if w > 0 && h > 0 {
-                let key = hwnd.0 as usize;
-                let mut sizes = POPUP_SIZES.lock().unwrap();
-                let entry = sizes.iter_mut().find(|(k, _)| *k == key);
-                let stale = match &entry {
-                    Some((_, s)) => *s != (w, h),
-                    None => true,
-                };
-                if stale {
-                    match entry {
-                        Some(e) => e.1 = (w, h),
-                        None => sizes.push((key, (w, h))),
-                    }
-                    drop(sizes);
-                    let dpi = GetDpiForWindow(hwnd).max(96);
-                    let rad = scale(8, dpi);
-                    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, rad * 2, rad * 2);
-                    let _ = SetWindowRgn(hwnd, Some(rgn), true); // system owns rgn
-                }
-            }
+            // Frame color follows the *popup's* theme — look it up on the
+            // owning window (stored when the hook installed the subclass).
+            let parent = GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT);
+            let owner = if parent != 0 {
+                HWND(parent as *mut c_void)
+            } else {
+                HWND(POPUP_HOOK_HWND.load(Ordering::Relaxed) as *mut c_void)
+            };
+            let app = GetWindowLongPtrW(owner, GWLP_USERDATA) as *mut App;
+            let color = if app.is_null() {
+                COLORREF(0x00707070)
+            } else {
+                (*app).theme.menu_sep
+            };
+            let dc = GetWindowDC(Some(hwnd));
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rc);
+            rc.right -= rc.left;
+            rc.bottom -= rc.top;
+            rc.left = 0;
+            rc.top = 0;
+            let b = CreateSolidBrush(color);
+            let _ = FrameRect(dc, &rc, b);
+            let _ = DeleteObject(HGDIOBJ(b.0));
+            let _ = ReleaseDC(Some(hwnd), dc);
             return r;
         }
         if msg == WM_NCDESTROY {
-            POPUP_SIZES
-                .lock()
-                .unwrap()
-                .retain(|(k, _)| *k != hwnd.0 as usize);
             let _ = RemoveWindowSubclass(hwnd, Some(popup_proc), POPUP_SUBCLASS);
         }
         DefSubclassProc(hwnd, msg, wparam, lparam)
     }
 }
 
-/// Last-applied region size per popup window, so WM_WINDOWPOSCHANGED echoes
-/// of our own SetWindowRgn don't loop.
-static POPUP_SIZES: std::sync::Mutex<Vec<(usize, (i32, i32))>> = std::sync::Mutex::new(Vec::new());
-
-/// Editor: Ctrl+mouse wheel zooms.
+/// Editor: Ctrl+wheel zooms, Enter auto-indents, scrolling repaints the
+/// line-number gutter.
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -2848,15 +3148,26 @@ unsafe extern "system" fn edit_proc(
     refdata: usize,
 ) -> LRESULT {
     unsafe {
-        if msg == WM_MOUSEWHEEL && (wparam.0 as u16 & 0x0008) != 0 {
-            let parent = HWND(refdata as *mut c_void);
-            let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-            if !app.is_null() {
+        let parent = HWND(refdata as *mut c_void);
+        let app = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
+        if app.is_null() {
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+        match msg {
+            WM_MOUSEWHEEL if (wparam.0 as u16 & 0x0008) != 0 => {
                 let delta = (wparam.0 >> 16) as i16;
                 (*app).zoom(if delta > 0 { 1 } else { -1 });
+                LRESULT(0)
             }
-            return LRESULT(0);
+            WM_CHAR if wparam.0 == 0x0D && (*app).auto_indent && (*app).auto_indent_newline(hwnd) => {
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL | WM_VSCROLL => {
+                let r = DefSubclassProc(hwnd, msg, wparam, lparam);
+                (*app).invalidate_gutter();
+                r
+            }
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
         }
-        DefSubclassProc(hwnd, msg, wparam, lparam)
     }
 }

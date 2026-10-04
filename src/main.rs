@@ -2,8 +2,11 @@
 
 mod app;
 mod document;
+mod draw;
 mod encoding;
+mod findbar;
 mod install;
+mod settings;
 mod theme;
 
 fn main() {

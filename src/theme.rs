@@ -57,6 +57,7 @@ pub struct Theme {
     pub menu_dim: COLORREF,   // grayed items and accelerators
     pub menu_sep: COLORREF,   // separator lines
     pub accent: COLORREF,     // brand orange, matches the logo
+    pub danger: COLORREF,     // "no results" and other error hints
 }
 
 pub fn light_theme() -> Theme {
@@ -76,6 +77,7 @@ pub fn light_theme() -> Theme {
         menu_dim: rgb(0x8A, 0x8A, 0x8A),
         menu_sep: rgb(0xD4, 0xD4, 0xD4),
         accent: rgb(0xE8, 0x55, 0x1E),
+        danger: rgb(0xC4, 0x2B, 0x1C),
     }
 }
 
@@ -96,6 +98,7 @@ pub fn dark_theme() -> Theme {
         menu_dim: rgb(0x8A, 0x8A, 0x8A),
         menu_sep: rgb(0x40, 0x40, 0x40),
         accent: rgb(0xE8, 0x55, 0x1E),
+        danger: rgb(0xFF, 0x7A, 0x6E),
     }
 }
 
