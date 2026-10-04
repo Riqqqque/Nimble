@@ -4,6 +4,7 @@ mod app;
 mod document;
 mod draw;
 mod encoding;
+mod fileio;
 mod findbar;
 mod install;
 mod settings;

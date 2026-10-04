@@ -29,36 +29,47 @@ pub fn argb(c: COLORREF) -> u32 {
     0xFF00_0000 | ((c.0 & 0xFF) << 16) | (c.0 & 0xFF00) | ((c.0 >> 16) & 0xFF)
 }
 
-/// An anti-aliased drawing context bound to an HDC. Create one per paint
-/// pass; dropping it frees the GpGraphics. The source HDC is kept for
-/// plain-GDI fallbacks.
+/// Fills `rc` with a solid color through the DC's stock brush: no brush
+/// object is created or destroyed.
+pub fn fill(hdc: HDC, rc: &RECT, color: COLORREF) {
+    unsafe {
+        SetDCBrushColor(hdc, color);
+        FillRect(hdc, rc, HBRUSH(GetStockObject(DC_BRUSH).0));
+    }
+}
+
+/// Anti-aliased shapes on an HDC that GDI also draws on. A GDI+ Graphics
+/// changes its HDC's state while it exists (GDI text drawn meanwhile loses
+/// the back buffer's viewport offset), so each shape gets its own short-lived
+/// Graphics and GDI always sees an untouched DC. Paints that draw no shapes
+/// never touch GDI+ at all.
 pub struct Aa {
-    g: *mut GpGraphics,
     hdc: HDC,
 }
 
 impl Aa {
     pub fn new(hdc: HDC) -> Self {
-        unsafe {
-            let mut g: *mut GpGraphics = std::ptr::null_mut();
-            let _ = GdipCreateFromHDC(hdc, &mut g);
-            if !g.is_null() {
-                let _ = GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-            }
-            Self { g, hdc }
-        }
+        Self { hdc }
     }
 
-    pub fn ok(&self) -> bool {
-        !self.g.is_null()
+    /// Runs `f` with a fresh anti-aliasing Graphics; false if GDI+ is
+    /// unavailable. GDI+ follows the HDC's viewport origin itself.
+    fn with_g(&self, f: impl FnOnce(*mut GpGraphics)) -> bool {
+        unsafe {
+            let mut g: *mut GpGraphics = std::ptr::null_mut();
+            let _ = GdipCreateFromHDC(self.hdc, &mut g);
+            if g.is_null() {
+                return false;
+            }
+            let _ = GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+            f(g);
+            let _ = GdipDeleteGraphics(g);
+            true
+        }
     }
 
     fn fallback_fill(&self, rc: &RECT, color: COLORREF) {
-        unsafe {
-            let b = CreateSolidBrush(color);
-            FillRect(self.hdc, rc, b);
-            let _ = DeleteObject(HGDIOBJ(b.0));
-        }
+        fill(self.hdc, rc, color);
     }
 
     /// Rounded-rectangle outline path; `top_only` rounds just the top
@@ -93,33 +104,28 @@ impl Aa {
     /// Filled rounded rectangle; `top_only` rounds just the top corners
     /// (selected-tab pill merging into the editor).
     pub fn fill_rounded(&self, rc: &RECT, rad: i32, top_only: bool, color: COLORREF) {
-        if !self.ok() {
-            // GDI fallback — better a square edge than nothing.
-            self.fallback_fill(rc, color);
-            return;
-        }
-        unsafe {
+        let drawn = self.with_g(|g| unsafe {
             let path = Self::rounded_path(rc, rad, top_only);
             if path.is_null() {
-                self.fallback_fill(rc, color);
                 return;
             }
             let mut brush: *mut GpSolidFill = std::ptr::null_mut();
             let _ = GdipCreateSolidFill(argb(color), &mut brush);
             if !brush.is_null() {
-                let _ = GdipFillPath(self.g, brush as *mut GpBrush, path);
+                let _ = GdipFillPath(g, brush as *mut GpBrush, path);
                 let _ = GdipDeleteBrush(brush as *mut GpBrush);
             }
             let _ = GdipDeletePath(path);
+        });
+        if !drawn {
+            // GDI fallback — better a square edge than nothing.
+            self.fallback_fill(rc, color);
         }
     }
 
     /// Rounded-rectangle outline, `w` pixels wide, drawn inside `rc`.
     pub fn stroke_rounded(&self, rc: &RECT, rad: i32, color: COLORREF, w: f32) {
-        if !self.ok() {
-            return;
-        }
-        unsafe {
+        self.with_g(|g| unsafe {
             // Inset by half the pen so the stroke stays inside the rect.
             let half = (w / 2.0).ceil() as i32;
             let inner = RECT {
@@ -135,24 +141,20 @@ impl Aa {
             let mut pen: *mut GpPen = std::ptr::null_mut();
             let _ = GdipCreatePen1(argb(color), w, UnitPixel, &mut pen);
             if !pen.is_null() {
-                let _ = GdipDrawPath(self.g, pen, path);
+                let _ = GdipDrawPath(g, pen, path);
                 let _ = GdipDeletePen(pen);
             }
             let _ = GdipDeletePath(path);
-        }
+        });
     }
 
     pub fn fill_ellipse(&self, rc: &RECT, color: COLORREF) {
-        if !self.ok() {
-            self.fallback_fill(rc, color);
-            return;
-        }
-        unsafe {
+        let drawn = self.with_g(|g| unsafe {
             let mut brush: *mut GpSolidFill = std::ptr::null_mut();
             let _ = GdipCreateSolidFill(argb(color), &mut brush);
             if !brush.is_null() {
                 let _ = GdipFillEllipseI(
-                    self.g,
+                    g,
                     brush as *mut GpBrush,
                     rc.left,
                     rc.top,
@@ -161,33 +163,30 @@ impl Aa {
                 );
                 let _ = GdipDeleteBrush(brush as *mut GpBrush);
             }
+        });
+        if !drawn {
+            self.fallback_fill(rc, color);
         }
     }
 
     /// Anti-aliased polyline through `pts` (2+ points), `w` in pixels.
     pub fn stroke(&self, pts: &[(i32, i32)], color: COLORREF, w: f32) {
-        if !self.ok() || pts.len() < 2 {
+        if pts.len() < 2 {
             return;
         }
-        unsafe {
+        self.with_g(|g| unsafe {
             let mut pen: *mut GpPen = std::ptr::null_mut();
             let _ = GdipCreatePen1(argb(color), w, UnitPixel, &mut pen);
             if pen.is_null() {
                 return;
             }
-            let points: Vec<Point> = pts.iter().map(|p| Point { X: p.0, Y: p.1 }).collect();
-            let _ = GdipDrawLinesI(self.g, pen, points.as_ptr(), points.len() as i32);
-            let _ = GdipDeletePen(pen);
-        }
-    }
-}
-
-impl Drop for Aa {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.g.is_null() {
-                let _ = GdipDeleteGraphics(self.g);
+            let mut points = [Point::default(); 8];
+            let n = pts.len().min(points.len());
+            for (d, p) in points.iter_mut().zip(pts) {
+                *d = Point { X: p.0, Y: p.1 };
             }
-        }
+            let _ = GdipDrawLinesI(g, pen, points.as_ptr(), n as i32);
+            let _ = GdipDeletePen(pen);
+        });
     }
 }
