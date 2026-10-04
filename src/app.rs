@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -21,10 +21,14 @@ use windows::core::{IUnknown, Interface, PCWSTR, PWSTR, w};
 
 use crate::document::Document;
 use crate::draw::{self, Aa};
+use crate::encoding::{Encoding, Eol};
 use crate::fileio;
 use crate::findbar::{self, BarMode};
-use crate::settings::{self, Action, Bind, MOD_CTRL, MOD_SHIFT};
+use crate::settings::{self, Action, Bind, MOD_ALT, MOD_CTRL, MOD_SHIFT};
+use crate::syntax::{LANGS, Lang};
 use crate::theme::{self, Theme, ThemeMode};
+
+mod code;
 
 const WND_CLASS: PCWSTR = w!("NimbleWindow");
 const CP_UTF16: u32 = 1200;
@@ -65,6 +69,42 @@ const IDM_SET_DEFAULT: u32 = 402;
 // Theme submenu IDs live in theme.rs (IDM_THEME_SYSTEM/LIGHT/DARK)
 const IDM_NEXT_TAB: u32 = 500;
 const IDM_PREV_TAB: u32 = 501;
+const IDM_FORMAT: u32 = 600;
+const IDM_MINIFY: u32 = 601;
+const IDM_SORT_KEYS: u32 = 602;
+const IDM_CONVERT: u32 = 603;
+const IDM_TOGGLE_COMMENT: u32 = 604;
+const IDM_INDENT_LINES: u32 = 605;
+const IDM_OUTDENT_LINES: u32 = 606;
+const IDM_MOVE_UP: u32 = 607;
+const IDM_MOVE_DOWN: u32 = 608;
+const IDM_DELETE_LINE: u32 = 609;
+const IDM_SELECT_LINE: u32 = 610;
+const IDM_MATCH_BRACKET: u32 = 611;
+const IDM_NEXT_PROBLEM: u32 = 612;
+const IDM_PREV_PROBLEM: u32 = 613;
+const IDM_COPY_PATH: u32 = 614;
+const IDM_TRIM_WS: u32 = 615;
+const IDM_SYNTAX: u32 = 616;
+const IDM_PICK_LANG: u32 = 617;
+const IDM_PICK_INDENT: u32 = 618;
+// Status-bar pickers: language (auto, then one per LANGS entry),
+// indentation, line endings, encoding.
+const IDM_LANG_AUTO: u32 = 699;
+const IDM_LANG_BASE: u32 = 700;
+const IDM_INDENT_TABS: u32 = 750;
+const IDM_INDENT_SPACES: u32 = 751;
+const IDM_INDENT_W2: u32 = 752;
+const IDM_INDENT_W4: u32 = 753;
+const IDM_INDENT_W8: u32 = 754;
+const IDM_INDENT_TO_SPACES: u32 = 755;
+const IDM_INDENT_TO_TABS: u32 = 756;
+const IDM_EOL_CRLF: u32 = 760;
+const IDM_EOL_LF: u32 = 761;
+const IDM_EOL_CR: u32 = 762;
+const IDM_ENC_BASE: u32 = 770; // + index into ENCODINGS
+const ENCODINGS: [Encoding; 5] =
+    [Encoding::Utf8, Encoding::Utf8Bom, Encoding::Utf16Le, Encoding::Utf16Be, Encoding::Ansi];
 
 /// Every command that can be rebound in Settings, in display order.
 pub(crate) const ACTIONS: &[Action] = &[
@@ -95,6 +135,25 @@ pub(crate) const ACTIONS: &[Action] = &[
     Action { cmd: IDM_WORD_WRAP, name: "Toggle word wrap", def: None },
     Action { cmd: IDM_LINE_NUMBERS, name: "Toggle line numbers", def: None },
     Action { cmd: IDM_STATUS_BAR, name: "Toggle status bar", def: None },
+    Action { cmd: IDM_SYNTAX, name: "Toggle syntax highlighting", def: None },
+    Action { cmd: IDM_FORMAT, name: "Format document", def: Some(Bind::new(MOD_SHIFT | MOD_ALT, 'F' as u16)) },
+    Action { cmd: IDM_MINIFY, name: "Minify JSON", def: None },
+    Action { cmd: IDM_SORT_KEYS, name: "Sort JSON keys", def: None },
+    Action { cmd: IDM_CONVERT, name: "Convert JSON / YAML", def: None },
+    Action { cmd: IDM_TOGGLE_COMMENT, name: "Toggle line comment", def: Some(Bind::new(MOD_CTRL, VK_OEM_2.0)) },
+    Action { cmd: IDM_INDENT_LINES, name: "Indent lines", def: Some(Bind::new(MOD_CTRL, VK_OEM_6.0)) },
+    Action { cmd: IDM_OUTDENT_LINES, name: "Outdent lines", def: Some(Bind::new(MOD_CTRL, VK_OEM_4.0)) },
+    Action { cmd: IDM_MOVE_UP, name: "Move line up", def: Some(Bind::new(MOD_ALT, VK_UP.0)) },
+    Action { cmd: IDM_MOVE_DOWN, name: "Move line down", def: Some(Bind::new(MOD_ALT, VK_DOWN.0)) },
+    Action { cmd: IDM_SELECT_LINE, name: "Select line", def: Some(Bind::new(MOD_CTRL, 'L' as u16)) },
+    Action { cmd: IDM_DELETE_LINE, name: "Delete line", def: Some(Bind::new(MOD_CTRL | MOD_SHIFT, 'K' as u16)) },
+    Action { cmd: IDM_TRIM_WS, name: "Trim trailing whitespace", def: None },
+    Action { cmd: IDM_MATCH_BRACKET, name: "Go to matching bracket", def: Some(Bind::new(MOD_CTRL | MOD_SHIFT, VK_OEM_5.0)) },
+    Action { cmd: IDM_NEXT_PROBLEM, name: "Next problem", def: Some(Bind::new(0, VK_F8.0)) },
+    Action { cmd: IDM_PREV_PROBLEM, name: "Previous problem", def: Some(Bind::new(MOD_SHIFT, VK_F8.0)) },
+    Action { cmd: IDM_COPY_PATH, name: "Copy JSON / YAML path", def: Some(Bind::new(MOD_CTRL | MOD_ALT, 'C' as u16)) },
+    Action { cmd: IDM_PICK_LANG, name: "Change language", def: None },
+    Action { cmd: IDM_PICK_INDENT, name: "Change indentation", def: None },
     Action { cmd: IDM_SETTINGS, name: "Open settings", def: Some(Bind::new(MOD_CTRL, VK_OEM_COMMA.0)) },
 ];
 
@@ -113,6 +172,16 @@ static ACCEL: AtomicUsize = AtomicUsize::new(0);
 
 /// Our window handle while a menu popup is being hooked (same thread only).
 static POPUP_HOOK_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// While a strip menu is open: which strip item it belongs to, how many
+/// items the strip has, and what the menu filter decided should happen
+/// when it closes (MENU_STAY: nothing; MENU_DONE: stay closed; n >= 0:
+/// open strip item n next).
+static MENU_CUR: AtomicUsize = AtomicUsize::new(0);
+static MENU_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MENU_NEXT: AtomicIsize = AtomicIsize::new(MENU_STAY);
+const MENU_STAY: isize = -1;
+const MENU_DONE: isize = -2;
 
 #[inline]
 pub(crate) fn sm(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
@@ -179,9 +248,15 @@ struct StripEntry {
 /// state updates (check marks, radio, enable/gray).
 struct MenuSet {
     strip: Vec<StripEntry>,
-    popups: Vec<HMENU>, // every popup incl. the theme submenu
+    popups: Vec<HMENU>, // every popup, for theming and metrics
     edit: HMENU,
     view: HMENU,
+    code: HMENU,
+    // Pickers opened from the status bar (and the Code menu).
+    lang: HMENU,
+    indent: HMENU,
+    eol: HMENU,
+    enc: HMENU,
 }
 
 pub(crate) struct App {
@@ -200,6 +275,19 @@ pub(crate) struct App {
     pub(crate) show_status: bool,
     pub(crate) line_numbers: bool,
     pub(crate) auto_indent: bool,
+    // Code preferences (Settings > Code).
+    pub(crate) syntax_on: bool,
+    pub(crate) rainbow: bool,
+    pub(crate) match_brackets: bool,
+    pub(crate) occurrences: bool,
+    pub(crate) validate: bool,
+    pub(crate) auto_close: bool,
+    pub(crate) insert_spaces: bool,
+    pub(crate) trim_on_save: bool,
+    pub(crate) final_newline: bool,
+    pub(crate) tab_size: u32,
+    /// Editor face's digit advance as a fraction of its em, for tab stops.
+    char_em: f32,
     pub(crate) edit_pt: i32,
     pub(crate) dpi: u32,
     pub(crate) font: HFONT,
@@ -208,9 +296,21 @@ pub(crate) struct App {
     next_id: usize,
     pub(crate) mode: ThemeMode,
     pub(crate) theme: Theme,
-    /// Status band segments, right to left: encoding, line endings, zoom,
-    /// caret position.
-    status_text: [String; 4],
+    /// Status band segments, right to left: language, line endings,
+    /// encoding, indentation, zoom, caret position.
+    status_text: [String; 6],
+    /// Where each segment was last drawn (clickable ones open pickers).
+    status_rects: [RECT; 6],
+    /// Left-aligned note: first problem, caret path, or "Valid", with a
+    /// tone (0 plain, 1 error, 2 ok, 3 warning), and where it was drawn.
+    status_note: (String, u8),
+    note_rect: RECT,
+    /// Status segment under the cursor (-1 none, 6 = the note).
+    status_hot: i32,
+    /// Tooltip explaining the problem under the mouse, and the problem's
+    /// span while it shows.
+    tip: HWND,
+    tip_for: Option<(i32, i32)>,
     tab_w: i32,    // cell width, set by layout()
     gutter_w: i32, // line-number gutter width, 0 when off
     pub(crate) binds: Vec<Option<Bind>>,
@@ -229,9 +329,9 @@ pub(crate) struct App {
     caret_ln: usize,
     /// Files from the command line, opened once the window exists.
     startup_files: Vec<PathBuf>,
-    /// Set when auto-indent handled an Enter keydown; the matching WM_CHAR
-    /// is dropped.
-    eat_enter_char: bool,
+    /// Set when a smart Enter / Tab / Backspace handled the keydown; the
+    /// matching WM_CHAR (this character) is dropped.
+    eat_char: u16,
 }
 
 /// WM_COPYDATA tag for "open these files" from a second launch.
@@ -583,6 +683,7 @@ fn build_menu() -> MenuSet {
             false,
             true,
         );
+        add_item(view, IDM_SYNTAX, "Synta&x Highlighting", false, false, true);
         add_sep(view);
         add_item(
             view,
@@ -624,6 +725,57 @@ fn build_menu() -> MenuSet {
         add_item(view, theme::IDM_THEME_LIGHT, "&Light", true, false, false);
         add_item(view, theme::IDM_THEME_DARK, "&Dark", true, false, false);
 
+        let code = CreatePopupMenu().unwrap_or_default();
+        add_item(code, IDM_FORMAT, "&Format Document\tShift+Alt+F", false, false, false);
+        add_item(code, IDM_MINIFY, "&Minify JSON", false, false, false);
+        add_item(code, IDM_SORT_KEYS, "Sort JSON &Keys", false, false, false);
+        add_item(code, IDM_CONVERT, "Con&vert JSON / YAML", false, false, false);
+        add_sep(code);
+        add_item(code, IDM_TOGGLE_COMMENT, "Toggle &Comment\tCtrl+/", false, false, false);
+        add_item(code, IDM_INDENT_LINES, "&Indent Lines\tCtrl+]", false, false, false);
+        add_item(code, IDM_OUTDENT_LINES, "&Outdent Lines\tCtrl+[", false, false, false);
+        add_item(code, IDM_MOVE_UP, "Move Line &Up\tAlt+Up", false, false, false);
+        add_item(code, IDM_MOVE_DOWN, "Move Line &Down\tAlt+Down", false, false, false);
+        add_item(code, IDM_SELECT_LINE, "Se&lect Line\tCtrl+L", false, false, false);
+        add_item(code, IDM_DELETE_LINE, "D&elete Line\tCtrl+Shift+K", false, false, false);
+        add_item(code, IDM_TRIM_WS, "&Trim Trailing Whitespace", false, false, false);
+        add_sep(code);
+        add_item(code, IDM_MATCH_BRACKET, "Go to Matching &Bracket\tCtrl+Shift+\\", false, false, false);
+        add_item(code, IDM_NEXT_PROBLEM, "&Next Problem\tF8", false, false, false);
+        add_item(code, IDM_PREV_PROBLEM, "&Previous Problem\tShift+F8", false, false, false);
+        add_item(code, IDM_COPY_PATH, "Copy JSON / YAML P&ath\tCtrl+Alt+C", false, false, false);
+        add_sep(code);
+        add_item(code, IDM_PICK_LANG, "Lan&guage...", false, false, false);
+        add_item(code, IDM_PICK_INDENT, "Indentatio&n...", false, false, false);
+
+        let lang = CreatePopupMenu().unwrap_or_default();
+        add_item(lang, IDM_LANG_AUTO, "Auto Detect", true, false, false);
+        add_sep(lang);
+        for (k, l) in LANGS.iter().enumerate() {
+            add_item(lang, IDM_LANG_BASE + k as u32, l.name(), true, false, false);
+        }
+
+        let indent = CreatePopupMenu().unwrap_or_default();
+        add_item(indent, IDM_INDENT_SPACES, "Indent Using Spaces", true, false, false);
+        add_item(indent, IDM_INDENT_TABS, "Indent Using Tabs", true, false, false);
+        add_sep(indent);
+        add_item(indent, IDM_INDENT_W2, "Width: 2", true, false, false);
+        add_item(indent, IDM_INDENT_W4, "Width: 4", true, false, false);
+        add_item(indent, IDM_INDENT_W8, "Width: 8", true, false, false);
+        add_sep(indent);
+        add_item(indent, IDM_INDENT_TO_SPACES, "Convert Indentation to Spaces", false, false, false);
+        add_item(indent, IDM_INDENT_TO_TABS, "Convert Indentation to Tabs", false, false, false);
+
+        let eol = CreatePopupMenu().unwrap_or_default();
+        add_item(eol, IDM_EOL_CRLF, Eol::Crlf.label(), true, false, false);
+        add_item(eol, IDM_EOL_LF, Eol::Lf.label(), true, false, false);
+        add_item(eol, IDM_EOL_CR, Eol::Cr.label(), true, false, false);
+
+        let enc = CreatePopupMenu().unwrap_or_default();
+        for (k, e) in ENCODINGS.iter().enumerate() {
+            add_item(enc, IDM_ENC_BASE + k as u32, e.label(), true, false, false);
+        }
+
         let help = CreatePopupMenu().unwrap_or_default();
         add_item(
             help,
@@ -649,11 +801,17 @@ fn build_menu() -> MenuSet {
                 strip_entry("&File", file),
                 strip_entry("&Edit", edit),
                 strip_entry("&View", view),
+                strip_entry("&Code", code),
                 strip_entry("&Help", help),
             ],
-            popups: vec![file, edit, view, help],
+            popups: vec![file, edit, view, code, help, lang, indent, eol, enc],
             edit,
             view,
+            code,
+            lang,
+            indent,
+            eol,
+            enc,
         }
     }
 }
@@ -715,6 +873,17 @@ impl App {
             show_status: prefs.status_bar,
             line_numbers: prefs.line_numbers,
             auto_indent: prefs.auto_indent,
+            syntax_on: prefs.syntax,
+            rainbow: prefs.rainbow,
+            match_brackets: prefs.match_brackets,
+            occurrences: prefs.occurrences,
+            validate: prefs.validate,
+            auto_close: prefs.auto_close,
+            insert_spaces: prefs.insert_spaces,
+            trim_on_save: prefs.trim_on_save,
+            final_newline: prefs.final_newline,
+            tab_size: prefs.tab_size,
+            char_em: 0.6,
             edit_pt: prefs.font_pt,
             dpi: 96,
             font: HFONT::default(),
@@ -724,6 +893,12 @@ impl App {
             mode,
             theme,
             status_text: Default::default(),
+            status_rects: Default::default(),
+            status_note: (String::new(), 0),
+            note_rect: RECT::default(),
+            status_hot: -1,
+            tip: HWND::default(),
+            tip_for: None,
             tab_w: 0,
             gutter_w: 0,
             binds,
@@ -736,7 +911,7 @@ impl App {
             scan_buf: Vec::new(),
             caret_ln: usize::MAX,
             startup_files,
-            eat_enter_char: false,
+            eat_char: 0,
         }
     }
 
@@ -746,6 +921,7 @@ impl App {
             let hdc = GetDC(Some(self.hwnd));
             self.ui_face = pick_face(hdc, &["Segoe UI Variable Text", "Segoe UI"]);
             self.edit_face = pick_face(hdc, &["Cascadia Mono", "Cascadia Code", "Consolas"]);
+            self.char_em = digit_em(hdc, &self.edit_face);
             let _ = ReleaseDC(Some(self.hwnd), hdc);
             self.font = ui_font(self.dpi, &self.ui_face);
 
@@ -770,6 +946,7 @@ impl App {
             match msg {
                 WM_SIZE => {
                     self.layout();
+                    self.highlight(None);
                     LRESULT(0)
                 }
                 WM_COMMAND => self.on_command(wparam, lparam),
@@ -812,6 +989,10 @@ impl App {
                     LRESULT(0)
                 }
                 WM_MOUSELEAVE => {
+                    if self.status_hot >= 0 {
+                        self.status_hot = -1;
+                        self.invalidate_status();
+                    }
                     if self.menu_hot >= 0 || self.tab_hot >= 0 || self.plus_hot {
                         self.menu_hot = -1;
                         self.tab_hot = -1;
@@ -835,6 +1016,10 @@ impl App {
                     }
                     if let Some(i) = self.tab_at(x, y) {
                         self.set_active(i);
+                        return LRESULT(0);
+                    }
+                    if let Some(k) = self.status_hit(x, y) {
+                        self.status_click(k);
                         return LRESULT(0);
                     }
                     DefWindowProcW(self.hwnd, msg, wparam, lparam)
@@ -913,6 +1098,17 @@ impl App {
                     }
                     LRESULT(1)
                 }
+                // Clickable status segments get the hand cursor.
+                WM_SETCURSOR if loword(lparam.0 as usize) == HTCLIENT && wparam.0 == self.hwnd.0 as usize => {
+                    let mut p = POINT::default();
+                    let _ = GetCursorPos(&mut p);
+                    let _ = ScreenToClient(self.hwnd, &mut p);
+                    if self.status_hit(p.x, p.y).is_some() {
+                        let _ = SetCursor(LoadCursorW(None, IDC_HAND).ok());
+                        return LRESULT(1);
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                }
                 // WM_PAINT covers every pixel the editors don't.
                 WM_ERASEBKGND => LRESULT(1),
                 WM_TIMER if wparam.0 == TIMER_RECOUNT => {
@@ -920,6 +1116,13 @@ impl App {
                     if let Some(i) = self.active.filter(|&i| self.docs[i].total_stale) {
                         self.recount(i);
                         self.invalidate_gutter();
+                    }
+                    LRESULT(0)
+                }
+                WM_TIMER if wparam.0 == code::TIMER_CHECK => {
+                    let _ = KillTimer(Some(self.hwnd), code::TIMER_CHECK);
+                    if let Some(i) = self.active {
+                        self.check(i);
                     }
                     LRESULT(0)
                 }
@@ -1083,7 +1286,9 @@ impl App {
             }
             sm(edit, EM_SETMODIFY, 0, 0);
             self.docs.push(doc);
-            self.set_active(self.docs.len() - 1);
+            let idx = self.docs.len() - 1;
+            self.detect_code(idx);
+            self.set_active(idx);
             true
         }
     }
@@ -1118,6 +1323,11 @@ impl App {
                 }
             }
             let _ = SetFocus(Some(self.docs[idx].edit));
+        }
+        self.apply_tab_stops(idx);
+        self.highlight(None);
+        if !self.docs[idx].checked {
+            self.schedule_check();
         }
         self.invalidate_tabs();
         self.update_title();
@@ -1273,17 +1483,32 @@ impl App {
             return;
         }
         use std::fmt::Write;
+        let note = self.compute_note(caret);
         let d = &self.docs[i];
-        let mut parts = [String::new(), String::new(), String::new(), String::new()];
-        parts[0].push_str(d.encoding.label());
-        parts[1].push_str(d.eol.label());
-        let _ = write!(parts[2], "{}%", d.zoom);
-        let _ = write!(parts[3], "Ln {}, Col {}", line + 1, caret - line_start + 1);
-        let changed = parts != self.status_text;
-        if changed {
-            self.status_text = parts;
+        let mut parts: [String; 6] = Default::default();
+        parts[0].push_str(d.lang.name());
+        parts[1].push_str(match d.eol {
+            Eol::Crlf => "CRLF",
+            Eol::Lf => "LF",
+            Eol::Cr => "CR",
+        });
+        parts[2].push_str(d.encoding.label());
+        let _ = if d.indent.tabs {
+            write!(parts[3], "Tab Size: {}", d.indent.size)
+        } else {
+            write!(parts[3], "Spaces: {}", d.indent.size)
+        };
+        if d.zoom != 100 {
+            let _ = write!(parts[4], "{}%", d.zoom);
         }
-        if changed {
+        let _ = write!(parts[5], "Ln {}, Col {}", line + 1, caret - line_start + 1);
+        let sel = get_sel(edit);
+        if sel.cpMax > sel.cpMin {
+            let _ = write!(parts[5], " ({} selected)", sel.cpMax - sel.cpMin);
+        }
+        if parts != self.status_text || note != self.status_note {
+            self.status_text = parts;
+            self.status_note = note;
             self.invalidate_status();
         }
     }
@@ -1294,16 +1519,19 @@ impl App {
         if lparam.0 != 0 {
             if hiword(wparam.0) == EN_VSCROLL {
                 self.invalidate_gutter();
+                self.highlight(None);
             } else if hiword(wparam.0) == EN_CHANGE {
                 let edit = HWND(lparam.0 as *mut c_void);
                 if let Some(i) = self.docs.iter().position(|d| d.edit.0 == edit.0) {
                     let d = &mut self.docs[i];
                     let cur = get_sel(edit);
-                    d.lines
-                        .invalidate_from(d.sel_prev.cpMin.min(d.sel_last.cpMin).min(cur.cpMin) - 1);
+                    let from = d.sel_prev.cpMin.min(d.sel_last.cpMin).min(cur.cpMin) - 1;
+                    d.lines.invalidate_from(from);
                     d.sel_prev = cur;
                     d.sel_last = cur;
                     d.total_stale = true;
+                    self.code_after_edit(i, from.max(0), cur.cpMax);
+                    let d = &mut self.docs[i];
                     let dirty = sm(edit, EM_GETMODIFY, 0, 0).0 != 0;
                     if dirty != d.dirty {
                         d.dirty = dirty;
@@ -1353,6 +1581,7 @@ impl App {
                         self.docs[i].lines.reset();
                         let op = if loword(wparam.0) == IDM_UNDO { EM_UNDO } else { EM_REDO };
                         sm(e, op, 0, 0);
+                        self.code_text_replaced(i);
                     }
                 }
                 IDM_CUT => {
@@ -1404,6 +1633,79 @@ impl App {
                 theme::IDM_THEME_DARK => self.set_theme(ThemeMode::Dark),
                 IDM_NEXT_TAB => self.cycle_tab(1),
                 IDM_PREV_TAB => self.cycle_tab(-1),
+                IDM_SYNTAX => self.set_pref("SyntaxHighlight", !self.syntax_on),
+                IDM_FORMAT => self.format_document(),
+                IDM_MINIFY => self.minify(),
+                IDM_SORT_KEYS => self.sort_keys(),
+                IDM_CONVERT => self.convert(),
+                IDM_TOGGLE_COMMENT => self.toggle_comment(),
+                IDM_INDENT_LINES => self.shift_lines(false),
+                IDM_OUTDENT_LINES => self.shift_lines(true),
+                IDM_MOVE_UP => self.move_lines(true),
+                IDM_MOVE_DOWN => self.move_lines(false),
+                IDM_DELETE_LINE => self.delete_lines(),
+                IDM_SELECT_LINE => self.select_line(),
+                IDM_TRIM_WS => {
+                    if let Some(i) = self.active {
+                        self.trim_trailing_ws(i);
+                    }
+                }
+                IDM_MATCH_BRACKET => self.goto_matching_bracket(),
+                IDM_NEXT_PROBLEM => self.goto_problem(true),
+                IDM_PREV_PROBLEM => self.goto_problem(false),
+                IDM_COPY_PATH => self.copy_path(),
+                IDM_PICK_LANG => self.open_picker(0),
+                IDM_PICK_INDENT => self.open_picker(3),
+                IDM_LANG_AUTO => {
+                    if let Some(i) = self.active {
+                        self.set_language(i, None);
+                    }
+                }
+                id if (IDM_LANG_BASE..IDM_LANG_BASE + LANGS.len() as u32).contains(&id) => {
+                    if let Some(i) = self.active {
+                        self.set_language(i, Some(LANGS[(id - IDM_LANG_BASE) as usize]));
+                    }
+                }
+                IDM_INDENT_TABS | IDM_INDENT_SPACES | IDM_INDENT_W2 | IDM_INDENT_W4 | IDM_INDENT_W8 => {
+                    if let Some(i) = self.active {
+                        let mut ind = self.docs[i].indent;
+                        match loword(wparam.0) {
+                            IDM_INDENT_TABS => ind.tabs = true,
+                            IDM_INDENT_SPACES => ind.tabs = false,
+                            IDM_INDENT_W2 => ind.size = 2,
+                            IDM_INDENT_W4 => ind.size = 4,
+                            _ => ind.size = 8,
+                        }
+                        self.set_indent(i, ind);
+                    }
+                }
+                IDM_INDENT_TO_SPACES | IDM_INDENT_TO_TABS => {
+                    if let Some(i) = self.active {
+                        self.convert_indentation(i, loword(wparam.0) == IDM_INDENT_TO_TABS);
+                    }
+                }
+                IDM_EOL_CRLF | IDM_EOL_LF | IDM_EOL_CR => {
+                    if let Some(i) = self.active {
+                        let eol = match loword(wparam.0) {
+                            IDM_EOL_CRLF => Eol::Crlf,
+                            IDM_EOL_LF => Eol::Lf,
+                            _ => Eol::Cr,
+                        };
+                        if self.docs[i].eol != eol {
+                            self.docs[i].eol = eol;
+                            self.mark_dirty(i);
+                        }
+                    }
+                }
+                id if (IDM_ENC_BASE..IDM_ENC_BASE + ENCODINGS.len() as u32).contains(&id) => {
+                    if let Some(i) = self.active {
+                        let enc = ENCODINGS[(id - IDM_ENC_BASE) as usize];
+                        if self.docs[i].encoding != enc {
+                            self.docs[i].encoding = enc;
+                            self.mark_dirty(i);
+                        }
+                    }
+                }
                 IDM_CHECK_UPDATES => self.check_updates(),
                 IDM_SET_DEFAULT => self.set_default_editor(),
                 IDM_ABOUT => self.about(),
@@ -1427,6 +1729,8 @@ impl App {
                     d.sel_last = sc.chrg;
                 }
                 if self.active_edit().map(|e| e.0) == Some(hdr.hwndFrom.0) {
+                    self.highlight(None);
+                    self.update_overlays();
                     self.update_status();
                 }
             }
@@ -1436,6 +1740,10 @@ impl App {
 
     fn on_init_menu_popup(&mut self, wparam: WPARAM) {
         let menu = HMENU(wparam.0 as *mut c_void);
+        if menu.0 == self.menus.code.0 {
+            self.init_code_menu();
+            return;
+        }
         if menu.0 != self.menus.edit.0 {
             return;
         }
@@ -1462,6 +1770,32 @@ impl App {
             let _ = EnableMenuItem(menu, IDM_COPY, flag(has_sel));
             let _ = EnableMenuItem(menu, IDM_DELETE, flag(has_sel));
             let _ = EnableMenuItem(menu, IDM_PASTE, flag(can_paste));
+        }
+    }
+
+    /// Grays Code menu items that don't apply to the active document.
+    fn init_code_menu(&mut self) {
+        let Some(i) = self.active else { return };
+        let d = &self.docs[i];
+        let json = d.lang == Lang::Json;
+        let data = json || d.lang == Lang::Yaml;
+        let menu = self.menus.code;
+        let flag = |on: bool| MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED };
+        let items = [
+            (IDM_FORMAT, data),
+            (IDM_MINIFY, json),
+            (IDM_SORT_KEYS, json),
+            (IDM_CONVERT, data),
+            (IDM_TOGGLE_COMMENT, d.lang.line_comment().is_some() || d.lang.block_comment().is_some()),
+            (IDM_NEXT_PROBLEM, !d.problems.is_empty()),
+            (IDM_PREV_PROBLEM, !d.problems.is_empty()),
+            (IDM_COPY_PATH, !d.tree.is_empty()),
+            (IDM_MATCH_BRACKET, d.lang != Lang::Plain),
+        ];
+        unsafe {
+            for (id, on) in items {
+                let _ = EnableMenuItem(menu, id, flag(on));
+            }
         }
     }
 
@@ -1520,6 +1854,7 @@ impl App {
         self.check_menu(IDM_WORD_WRAP, self.word_wrap);
         self.check_menu(IDM_STATUS_BAR, self.show_status);
         self.check_menu(IDM_LINE_NUMBERS, self.line_numbers);
+        self.check_menu(IDM_SYNTAX, self.syntax_on);
         self.sync_active_view();
         self.layout();
         self.update_status();
@@ -1531,6 +1866,9 @@ impl App {
     /// Applies the editor font size from Settings (other tabs when shown).
     pub(crate) fn apply_font_size(&mut self) {
         self.sync_active_view();
+        if let Some(i) = self.active {
+            self.apply_tab_stops(i);
+        }
         self.layout();
         self.invalidate_gutter();
     }
@@ -1664,6 +2002,8 @@ impl App {
         theme::set_titlebar_dark(self.hwnd, dark);
         theme::set_titlebar_color(self.hwnd, self.theme.chrome_bg, self.theme.menu_fg);
         self.sync_active_view();
+        // Code colors are per theme.
+        self.recolor_all();
         findbar::retheme(self);
         settings::retheme(self);
         unsafe {
@@ -1957,6 +2297,11 @@ impl App {
         let tab_hit = self.tab_at(x, y).map(|i| i as i32).unwrap_or(-1);
         let close_hit = self.close_at(x, y).map(|i| i as i32).unwrap_or(-1);
         let plus_hit = pt_in_rect(&self.plus_rect(), x, y);
+        let status_hit = self.status_hit(x, y).map(|k| k as i32).unwrap_or(-1);
+        if status_hit != self.status_hot {
+            self.status_hot = status_hit;
+            self.invalidate_status();
+        }
         if menu_hit != self.menu_hot {
             self.menu_hot = menu_hit;
             self.invalidate_strip();
@@ -1970,7 +2315,7 @@ impl App {
             self.plus_hot = plus_hit;
             self.invalidate_tabs();
         }
-        if menu_hit >= 0 || tab_hit >= 0 || plus_hit {
+        if menu_hit >= 0 || tab_hit >= 0 || plus_hit || status_hit >= 0 {
             unsafe {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2125,6 +2470,9 @@ impl App {
             let first = sm(edit, EM_GETFIRSTVISIBLELINE, 0, 0).0.max(0);
             let mut digits = [0u16; 20];
             let mut row = first;
+            let mut last_y = i32::MIN;
+            let line_h = text_height(hdc, &[b'0' as u16]);
+            let aa = Aa::new(hdc);
             loop {
                 let charidx = sm(edit, EM_LINEINDEX, row as usize, 0).0;
                 if charidx < 0 {
@@ -2137,6 +2485,12 @@ impl App {
                     break;
                 }
                 row += 1;
+                // The empty row after a final line break reports the
+                // previous row's position; it has no number of its own.
+                if y <= last_y {
+                    continue;
+                }
+                last_y = y;
                 let ln = if wraps {
                     let (ln, start) = self.line_at(i, charidx as i32);
                     if start != charidx as i32 {
@@ -2146,6 +2500,19 @@ impl App {
                 } else {
                     row as usize - 1
                 };
+                // Problem marker: a dot at the gutter's left edge.
+                let probs = &self.docs[i].problems;
+                let k = probs.partition_point(|p| p.line < ln);
+                if self.validate && k < probs.len() && probs[k].line == ln {
+                    let error = probs[k..].iter().take_while(|p| p.line == ln).any(|p| !p.warning);
+                    let r = scale(3, self.dpi);
+                    let cx = band.left + scale(7, self.dpi);
+                    let cy = y + line_h / 2;
+                    aa.fill_ellipse(
+                        &RECT { left: cx - r, top: cy - r, right: cx + r, bottom: cy + r },
+                        if error { th.danger } else { th.warn },
+                    );
+                }
                 SetTextColor(hdc, if ln == caret_line { th.tab_fg } else { th.menu_dim });
                 let n = format_num(ln + 1, &mut digits);
                 let _ = TextOutW(hdc, x, y, &digits[digits.len() - n..]);
@@ -2164,42 +2531,30 @@ impl App {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
             let r = ps.rcPaint;
-            let (w, h) = (r.right - r.left, r.bottom - r.top);
-            if w > 0 && h > 0 {
-                let mem = CreateCompatibleDC(Some(hdc));
-                let bmp = CreateCompatibleBitmap(hdc, w, h);
-                let old = SelectObject(mem, HGDIOBJ(bmp.0));
-                // Draw in client coordinates; the buffer holds just `r`.
-                let _ = SetViewportOrgEx(mem, -r.left, -r.top, None);
+            draw::buffered(hdc, &r, |mem| {
                 draw::fill(mem, &r, self.theme.edit_bg);
-                {
-                    let aa = Aa::new(mem);
-                    let mut client = RECT::default();
-                    let _ = GetClientRect(self.hwnd, &mut client);
-                    let overlaps = |top: i32, bottom: i32, right: i32| {
-                        r.top < bottom && r.bottom > top && r.left < right
-                    };
-                    let menu_h = self.menu_h();
-                    let tabs_b = menu_h + self.tab_strip_h();
-                    let status_t = client.bottom - self.status_h();
-                    if overlaps(0, menu_h, client.right) {
-                        self.paint_menu_strip(mem, &aa);
-                    }
-                    if overlaps(menu_h, tabs_b, client.right) {
-                        self.paint_tabs(mem, &aa);
-                    }
-                    if overlaps(self.edit_top(), status_t, self.gutter_w) {
-                        self.paint_gutter(mem);
-                    }
-                    if overlaps(status_t, client.bottom, client.right) {
-                        self.paint_status(mem);
-                    }
+                let aa = Aa::new(mem);
+                let mut client = RECT::default();
+                let _ = GetClientRect(self.hwnd, &mut client);
+                let overlaps = |top: i32, bottom: i32, right: i32| {
+                    r.top < bottom && r.bottom > top && r.left < right
+                };
+                let menu_h = self.menu_h();
+                let tabs_b = menu_h + self.tab_strip_h();
+                let status_t = client.bottom - self.status_h();
+                if overlaps(0, menu_h, client.right) {
+                    self.paint_menu_strip(mem, &aa);
                 }
-                let _ = BitBlt(hdc, r.left, r.top, w, h, Some(mem), r.left, r.top, SRCCOPY);
-                SelectObject(mem, old);
-                let _ = DeleteObject(HGDIOBJ(bmp.0));
-                let _ = DeleteDC(mem);
-            }
+                if overlaps(menu_h, tabs_b, client.right) {
+                    self.paint_tabs(mem, &aa);
+                }
+                if overlaps(self.edit_top(), status_t, self.gutter_w) {
+                    self.paint_gutter(mem);
+                }
+                if overlaps(status_t, client.bottom, client.right) {
+                    self.paint_status(mem);
+                }
+            });
             let _ = EndPaint(self.hwnd, &ps);
         }
     }
@@ -2223,7 +2578,7 @@ impl App {
 
     /// Status band: flat chrome strip with a hairline on top and segments
     /// laid out from the right edge, split by short dividers.
-    fn paint_status(&self, hdc: HDC) {
+    fn paint_status(&mut self, hdc: HDC) {
         if !self.show_status {
             return;
         }
@@ -2237,36 +2592,197 @@ impl App {
 
             let old = SelectObject(hdc, HGDIOBJ(self.font.0));
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, th.status_fg);
-            let pad = scale(12, self.dpi);
+            let pad = scale(10, self.dpi);
+            let inset = scale(4, self.dpi);
             let mut right = band.right - scale(6, self.dpi);
+            let mut first = true;
             for (k, text) in self.status_text.iter().enumerate() {
                 if text.is_empty() {
+                    self.status_rects[k] = RECT::default();
                     continue;
                 }
-                let mut t = [0u16; 64];
-                let n = text.encode_utf16().zip(t.iter_mut()).map(|(c, d)| *d = c).count();
-                let w = text_extent(hdc, &t[..n]) + pad * 2;
-                let mut r = RECT {
-                    left: right - w,
-                    top: band.top + 1,
-                    right,
-                    bottom: band.bottom,
-                };
-                DrawTextW(hdc, &mut t[..n], &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                right -= w;
-                if k + 1 < self.status_text.len() {
-                    let inset = scale(6, self.dpi);
+                let t: Vec<u16> = text.encode_utf16().collect();
+                let w = text_extent(hdc, &t) + pad * 2;
+                let r = RECT { left: right - w, top: band.top + 1, right, bottom: band.bottom };
+                if !first {
                     let div = RECT {
                         left: right,
-                        top: band.top + inset,
+                        top: band.top + scale(6, self.dpi),
                         right: right + 1,
-                        bottom: band.bottom - inset,
+                        bottom: band.bottom - scale(6, self.dpi),
                     };
                     draw::fill(hdc, &div, th.menu_sep);
                 }
+                first = false;
+                if self.status_hot == k as i32 {
+                    let hot = RECT { top: r.top + inset / 2, bottom: r.bottom - inset / 2, left: r.left + 2, right: r.right - 2 };
+                    draw::fill(hdc, &hot, th.menu_hover);
+                }
+                SetTextColor(hdc, if self.status_hot == k as i32 { th.menu_fg } else { th.status_fg });
+                let mut tr = r;
+                let mut t = t;
+                DrawTextW(hdc, &mut t, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                self.status_rects[k] = r;
+                right -= w;
+            }
+            // The note takes whatever room is left on the left.
+            let left = band.left + scale(10, self.dpi);
+            self.note_rect = RECT::default();
+            if !self.status_note.0.is_empty() && right - scale(12, self.dpi) > left {
+                let (text, tone) = &self.status_note;
+                let color = match tone {
+                    1 => th.danger,
+                    2 => th.syn.comment,
+                    3 => th.warn,
+                    _ => th.status_fg,
+                };
+                let mut t: Vec<u16> = text.encode_utf16().collect();
+                let mut r = RECT { left, top: band.top + 1, right: right - scale(12, self.dpi), bottom: band.bottom };
+                let w = text_extent(hdc, &t).min(r.right - r.left);
+                if self.status_hot == 6 {
+                    let hot = RECT { left: left - scale(6, self.dpi), top: r.top + inset / 2, right: left + w + scale(6, self.dpi), bottom: r.bottom - inset / 2 };
+                    draw::fill(hdc, &hot, th.menu_hover);
+                }
+                if *tone == 2 && t.len() > 2 {
+                    // "✓ Valid JSON · path": only the check mark is green.
+                    SetTextColor(hdc, color);
+                    let mut mark = t[..2].to_vec();
+                    let mut mr = r;
+                    DrawTextW(hdc, &mut mark, &mut mr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    r.left += text_extent(hdc, &t[..2]);
+                    t.drain(..2);
+                    SetTextColor(hdc, th.status_fg);
+                } else {
+                    SetTextColor(hdc, color);
+                }
+                DrawTextW(hdc, &mut t, &mut r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                self.note_rect = RECT { left: left - scale(6, self.dpi), top: band.top, right: left + w + scale(6, self.dpi), bottom: band.bottom };
             }
             SelectObject(hdc, old);
+        }
+    }
+
+    /// Status segment at client point: 0..6 as in status_text, 6 = note.
+    fn status_hit(&self, x: i32, y: i32) -> Option<usize> {
+        if !self.show_status || y < self.status_band().top {
+            return None;
+        }
+        // Language, line endings, encoding, indentation and the note react
+        // to clicks; zoom and position don't.
+        if pt_in_rect(&self.note_rect, x, y) && self.note_clickable() {
+            return Some(6);
+        }
+        [0, 1, 2, 3].into_iter().find(|&k| pt_in_rect(&self.status_rects[k], x, y))
+    }
+
+    fn note_clickable(&self) -> bool {
+        self.active.is_some_and(|i| !self.docs[i].problems.is_empty())
+    }
+
+    /// Click on a status segment: open its picker above it.
+    fn status_click(&mut self, k: usize) {
+        let Some(i) = self.active else { return };
+        if k == 6 {
+            self.goto_problem(true);
+            return;
+        }
+        let r = self.status_rects[k];
+        let menu = match k {
+            0 => self.menus.lang,
+            1 => self.menus.eol,
+            2 => self.menus.enc,
+            _ => self.menus.indent,
+        };
+        self.prepare_picker(menu, i);
+        let cmd = self.track_popup(menu, POINT { x: r.left, y: r.top }, true);
+        if cmd != 0 {
+            self.on_command(WPARAM(cmd as usize), LPARAM(0));
+        }
+    }
+
+    /// Sets the radio marks in a picker for doc `i`.
+    fn prepare_picker(&self, menu: HMENU, i: usize) {
+        let d = &self.docs[i];
+        let radio = |first: u32, last: u32, on: u32| unsafe {
+            let _ = CheckMenuRadioItem(menu, first, last, on, MF_BYCOMMAND.0);
+        };
+        if menu.0 == self.menus.lang.0 {
+            let last = IDM_LANG_BASE + LANGS.len() as u32 - 1;
+            // Clear every mark, then set the one that applies.
+            for id in std::iter::once(IDM_LANG_AUTO).chain(IDM_LANG_BASE..=last) {
+                unsafe {
+                    let _ = CheckMenuItem(menu, id, MF_BYCOMMAND.0 | MF_UNCHECKED.0);
+                }
+            }
+            let on = if d.lang_auto {
+                IDM_LANG_AUTO
+            } else {
+                IDM_LANG_BASE + LANGS.iter().position(|&l| l == d.lang).unwrap_or(0) as u32
+            };
+            unsafe {
+                let _ = CheckMenuItem(menu, on, MF_BYCOMMAND.0 | MF_CHECKED.0);
+            }
+        } else if menu.0 == self.menus.indent.0 {
+            radio(IDM_INDENT_TABS, IDM_INDENT_SPACES, if d.indent.tabs { IDM_INDENT_TABS } else { IDM_INDENT_SPACES });
+            let w = match d.indent.size {
+                2 => IDM_INDENT_W2,
+                8 => IDM_INDENT_W8,
+                _ => IDM_INDENT_W4,
+            };
+            radio(IDM_INDENT_W2, IDM_INDENT_W8, w);
+        } else if menu.0 == self.menus.eol.0 {
+            let on = match d.eol {
+                Eol::Crlf => IDM_EOL_CRLF,
+                Eol::Lf => IDM_EOL_LF,
+                Eol::Cr => IDM_EOL_CR,
+            };
+            radio(IDM_EOL_CRLF, IDM_EOL_CR, on);
+        } else if menu.0 == self.menus.enc.0 {
+            let k = ENCODINGS.iter().position(|&e| e == d.encoding).unwrap_or(0) as u32;
+            radio(IDM_ENC_BASE, IDM_ENC_BASE + ENCODINGS.len() as u32 - 1, IDM_ENC_BASE + k);
+        }
+    }
+
+    /// Shows a themed popup at client point `pt` (its bottom-left corner
+    /// when `above`) and returns the picked command, 0 if none.
+    fn track_popup(&mut self, menu: HMENU, pt: POINT, above: bool) -> u32 {
+        unsafe {
+            POPUP_HOOK_HWND.store(self.hwnd.0 as usize, Ordering::Relaxed);
+            let cbt = SetWindowsHookExW(WH_CBT, Some(menu_hook_proc), None, GetCurrentThreadId())
+                .unwrap_or_default();
+            let mut p = pt;
+            let _ = ClientToScreen(self.hwnd, &mut p);
+            let flags = TPM_LEFTALIGN | TPM_RETURNCMD | if above { TPM_BOTTOMALIGN } else { TPM_TOPALIGN };
+            let cmd = TrackPopupMenuEx(menu, flags.0, p.x, p.y, self.hwnd, None).0 as u32;
+            if !cbt.0.is_null() {
+                let _ = UnhookWindowsHookEx(cbt);
+            }
+            POPUP_HOOK_HWND.store(0, Ordering::Relaxed);
+            self.status_hot = -1;
+            self.invalidate_status();
+            cmd
+        }
+    }
+
+    /// Opens a picker from the Code menu / a shortcut: above its status
+    /// segment when the status bar shows, else at the caret.
+    fn open_picker(&mut self, k: usize) {
+        if self.show_status && self.status_rects[k].right > self.status_rects[k].left {
+            self.status_click(k);
+            return;
+        }
+        let Some(i) = self.active else { return };
+        let menu = if k == 0 { self.menus.lang } else { self.menus.indent };
+        self.prepare_picker(menu, i);
+        let edit = self.docs[i].edit;
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCaretPos(&mut pt);
+            let _ = MapWindowPoints(Some(edit), Some(self.hwnd), std::slice::from_mut(&mut pt));
+        }
+        let cmd = self.track_popup(menu, POINT { x: pt.x, y: pt.y + scale(20, self.dpi) }, false);
+        if cmd != 0 {
+            self.on_command(WPARAM(cmd as usize), LPARAM(0));
         }
     }
 
@@ -2356,15 +2872,22 @@ impl App {
         }
     }
 
-    /// Shows the popup for strip item `idx`; while open, clicking a different
-    /// strip entry chains into that menu like a classic menu bar. A CBT hook
-    /// watches for the popup window so its corners can be rounded.
+    /// Shows the popup for strip item `idx` and behaves like a real menu
+    /// bar while it's open: clicking the open item's title closes it,
+    /// hovering another title (or pressing Left/Right) switches to that
+    /// menu. A message-filter hook watches the menu's own modal loop for
+    /// this; a CBT hook themes each popup window as it's created.
     fn menu_loop(&mut self, mut idx: usize) {
         unsafe {
             POPUP_HOOK_HWND.store(self.hwnd.0 as usize, Ordering::Relaxed);
-            let hook = SetWindowsHookExW(WH_CBT, Some(menu_hook_proc), None, GetCurrentThreadId())
-                .unwrap_or_default();
+            MENU_COUNT.store(self.menus.strip.len(), Ordering::Relaxed);
+            let tid = GetCurrentThreadId();
+            let cbt = SetWindowsHookExW(WH_CBT, Some(menu_hook_proc), None, tid).unwrap_or_default();
+            let filter =
+                SetWindowsHookExW(WH_MSGFILTER, Some(menu_filter_proc), None, tid).unwrap_or_default();
             loop {
+                MENU_CUR.store(idx, Ordering::Relaxed);
+                MENU_NEXT.store(MENU_STAY, Ordering::Relaxed);
                 self.menu_open = idx as i32;
                 self.menu_hot = idx as i32;
                 self.invalidate_strip();
@@ -2390,18 +2913,15 @@ impl App {
                     self.on_command(WPARAM(cmd as usize), LPARAM(0));
                     break;
                 }
-                // Dismissed: only chain when the cursor landed on a
-                // different strip item (i.e. the click that closed us).
-                let mut p = POINT::default();
-                let _ = GetCursorPos(&mut p);
-                let _ = ScreenToClient(self.hwnd, &mut p);
-                match self.strip_hit(p.x, p.y) {
-                    Some(n) if n != idx => idx = n,
+                match MENU_NEXT.swap(MENU_STAY, Ordering::Relaxed) {
+                    n if n >= 0 => idx = n as usize,
                     _ => break,
                 }
             }
-            if !hook.0.is_null() {
-                let _ = UnhookWindowsHookEx(hook);
+            for h in [filter, cbt] {
+                if !h.0.is_null() {
+                    let _ = UnhookWindowsHookEx(h);
+                }
             }
             POPUP_HOOK_HWND.store(0, Ordering::Relaxed);
             if let Some(e) = self.active_edit() {
@@ -2481,7 +3001,17 @@ impl App {
         }
     }
 
+    /// Owner-drawn popup item, painted off-screen so hovering through a menu
+    /// doesn't flash each item as it's redrawn.
     fn draw_menu_item(&self, dis: &DRAWITEMSTRUCT) {
+        draw::buffered(dis.hDC, &dis.rcItem, |mem| {
+            let mut d = *dis;
+            d.hDC = mem;
+            self.draw_menu_item_into(&d);
+        });
+    }
+
+    fn draw_menu_item_into(&self, dis: &DRAWITEMSTRUCT) {
         unsafe {
             let th = self.theme;
             let d = dis.itemData as *const MenuItemData;
@@ -2711,6 +3241,8 @@ impl App {
         d.total_stale = true;
         d.sel_prev = CHARRANGE { cpMin: c, cpMax: c };
         d.sel_last = d.sel_prev;
+        self.code_text_replaced(i);
+        let d = &mut self.docs[i];
         if !d.dirty {
             d.dirty = true;
             self.refresh_tab(i);
@@ -2772,29 +3304,6 @@ impl App {
         let shift = end - start + 1;
         set_sel(edit, sel.cpMin + shift, sel.cpMax + shift);
         sm(edit, EM_SCROLLCARET, 0, 0);
-    }
-
-    /// Enter with auto-indent on: carry the current line's leading
-    /// whitespace onto the new line. Returns false to let RichEdit handle
-    /// a plain Enter.
-    fn auto_indent_newline(&mut self, edit: HWND) -> bool {
-        let Some(i) = self.docs.iter().position(|d| d.edit.0 == edit.0) else {
-            return false;
-        };
-        let sel = get_sel(edit);
-        let (_, start) = self.line_at(i, sel.cpMin);
-        let indent: Vec<u16> = get_range(edit, start, sel.cpMin)
-            .into_iter()
-            .take_while(|&c| c == b' ' as u16 || c == b'\t' as u16)
-            .collect();
-        if indent.is_empty() {
-            return false;
-        }
-        let mut ins = vec![13u16];
-        ins.extend(indent);
-        ins.push(0);
-        sm(edit, EM_REPLACESEL, 1, ins.as_ptr() as isize);
-        true
     }
 
     // ---- files -----------------------------------------------------------
@@ -2877,13 +3386,22 @@ impl App {
         match file_dialog(self.hwnd, false, Some(&self.docs[i].name())) {
             Some(path) => {
                 self.docs[i].path = Some(path.clone());
-                self.write_doc(i, &path)
+                let ok = self.write_doc(i, &path);
+                self.redetect_language(i);
+                ok
             }
             None => false,
         }
     }
 
     fn write_doc(&mut self, i: usize, path: &Path) -> bool {
+        // Markdown uses trailing spaces as line breaks.
+        if self.trim_on_save && self.docs[i].lang != Lang::Markdown {
+            self.trim_trailing_ws(i);
+        }
+        if self.final_newline {
+            self.ensure_final_newline(i);
+        }
         let d = &self.docs[i];
         let saved = unsafe {
             let wait = SetCursor(LoadCursorW(None, IDC_WAIT).ok());
@@ -3002,6 +3520,34 @@ fn pick_face(hdc: HDC, candidates: &[&str]) -> String {
             }
         }
         candidates.last().map(|s| s.to_string()).unwrap_or_default()
+    }
+}
+
+/// Advance of '0' in `face`, as a fraction of the font's em.
+fn digit_em(hdc: HDC, face: &str) -> f32 {
+    let wface = wide(face);
+    unsafe {
+        let f = CreateFontW(
+            -1000,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            0,
+            PCWSTR(wface.as_ptr()),
+        );
+        let old = SelectObject(hdc, HGDIOBJ(f.0));
+        let w = text_extent(hdc, &wide("0")[..1]);
+        SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(f.0));
+        if w > 0 { w as f32 / 1000.0 } else { 0.6 }
     }
 }
 
@@ -3276,6 +3822,60 @@ fn draw_radio_glyph(aa: &Aa, rc: &RECT, color: COLORREF, _dpi: u32) {
 
 // ---- subclasses ------------------------------------------------------------
 
+/// Message filter for an open strip menu (see menu_loop). Returning 1
+/// swallows the message, so the click that closes a menu can't also reach
+/// the window underneath and reopen it.
+unsafe extern "system" fn menu_filter_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if code == MSGF_MENU as i32 && lparam.0 != 0 {
+            let msg = &*(lparam.0 as *const MSG);
+            let owner = HWND(POPUP_HOOK_HWND.load(Ordering::Relaxed) as *mut c_void);
+            let app = GetWindowLongPtrW(owner, GWLP_USERDATA) as *const App;
+            if !app.is_null() {
+                let cur = MENU_CUR.load(Ordering::Relaxed);
+                let n = MENU_COUNT.load(Ordering::Relaxed).max(1);
+                let over = || {
+                    let mut p = msg.pt;
+                    let _ = ScreenToClient(owner, &mut p);
+                    (*app).strip_hit(p.x, p.y)
+                };
+                let switch = |next: isize| {
+                    MENU_NEXT.store(next, Ordering::Relaxed);
+                    let _ = EndMenu();
+                };
+                match msg.message {
+                    WM_MOUSEMOVE => {
+                        if let Some(i) = over().filter(|&i| i != cur) {
+                            switch(i as isize);
+                        }
+                    }
+                    WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => match over() {
+                        Some(i) if i == cur => {
+                            switch(MENU_DONE);
+                            return LRESULT(1);
+                        }
+                        Some(i) => {
+                            switch(i as isize);
+                            return LRESULT(1);
+                        }
+                        None => {}
+                    },
+                    WM_KEYDOWN if msg.wParam.0 == VK_LEFT.0 as usize => {
+                        switch(((cur + n - 1) % n) as isize);
+                        return LRESULT(1);
+                    }
+                    WM_KEYDOWN if msg.wParam.0 == VK_RIGHT.0 as usize => {
+                        switch(((cur + 1) % n) as isize);
+                        return LRESULT(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
 /// CBT hook active while a TrackPopupMenuEx popup is open: subclasses each
 /// menu window ("#32768") so its frame is themed. Corner rounding is left to
 /// DWM (Windows 11 draws popups rounded natively) — SetWindowRgn would clip
@@ -3375,26 +3975,55 @@ unsafe extern "system" fn edit_proc(
                 (*app).zoom(if delta > 0 { 1 } else { -1 });
                 LRESULT(0)
             }
-            // RichEdit breaks the line on WM_KEYDOWN, so auto-indent has to
-            // act there; the WM_CHAR that TranslateMessage already queued
-            // is then swallowed so it can't add a second break.
-            WM_KEYDOWN
-                if wparam.0 == VK_RETURN.0 as usize
-                    && (*app).auto_indent
-                    && !key_down(VK_CONTROL)
-                    && !key_down(VK_MENU)
-                    && (*app).auto_indent_newline(hwnd) =>
-            {
-                (*app).eat_enter_char = true;
-                LRESULT(0)
+            // RichEdit acts on Enter, Tab and Backspace at WM_KEYDOWN, so
+            // smart versions of them act there too; the WM_CHAR that
+            // TranslateMessage already queued is then swallowed.
+            WM_KEYDOWN if !key_down(VK_CONTROL) && !key_down(VK_MENU) => {
+                let a = &mut *app;
+                a.hide_tip();
+                let handled = match VIRTUAL_KEY(wparam.0 as u16) {
+                    VK_RETURN => a.auto_indent && a.smart_newline(hwnd),
+                    VK_TAB => a.on_tab(hwnd, key_down(VK_SHIFT)),
+                    VK_BACK => a.on_backspace(hwnd),
+                    _ => false,
+                };
+                if handled {
+                    a.eat_char = match VIRTUAL_KEY(wparam.0 as u16) {
+                        VK_RETURN => 0x0D,
+                        VK_TAB => 0x09,
+                        _ => 0x08,
+                    };
+                    return LRESULT(0);
+                }
+                a.eat_char = 0;
+                DefSubclassProc(hwnd, msg, wparam, lparam)
             }
-            WM_CHAR if wparam.0 == 0x0D && std::mem::take(&mut (*app).eat_enter_char) => {
-                LRESULT(0)
+            WM_CHAR => {
+                let a = &mut *app;
+                let ch = wparam.0 as u16;
+                if a.eat_char != 0 && a.eat_char == ch {
+                    a.eat_char = 0;
+                    return LRESULT(0);
+                }
+                if a.on_char(hwnd, ch) {
+                    return LRESULT(0);
+                }
+                DefSubclassProc(hwnd, msg, wparam, lparam)
             }
             WM_MOUSEWHEEL | WM_VSCROLL => {
+                (*app).hide_tip();
                 let r = DefSubclassProc(hwnd, msg, wparam, lparam);
                 (*app).invalidate_gutter();
+                (*app).highlight(None);
                 r
+            }
+            WM_MOUSEMOVE => {
+                (*app).hover_problem(hwnd, x_lparam(lparam), y_lparam(lparam));
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+            WM_MOUSELEAVE | WM_KILLFOCUS | WM_LBUTTONDOWN => {
+                (*app).hide_tip();
+                DefSubclassProc(hwnd, msg, wparam, lparam)
             }
             _ => DefSubclassProc(hwnd, msg, wparam, lparam),
         }

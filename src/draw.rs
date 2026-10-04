@@ -29,6 +29,28 @@ pub fn argb(c: COLORREF) -> u32 {
     0xFF00_0000 | ((c.0 & 0xFF) << 16) | (c.0 & 0xFF00) | ((c.0 >> 16) & 0xFF)
 }
 
+/// Paints `rc` (in `hdc`'s coordinates) through an off-screen buffer, so
+/// a window never shows a half-drawn frame — hover changes used to flash
+/// as backgrounds were filled before their contents were drawn. `f` draws
+/// in the same coordinates it would use on `hdc` directly.
+pub fn buffered(hdc: HDC, rc: &RECT, f: impl FnOnce(HDC)) {
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    unsafe {
+        let mem = CreateCompatibleDC(Some(hdc));
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old = SelectObject(mem, HGDIOBJ(bmp.0));
+        let _ = SetViewportOrgEx(mem, -rc.left, -rc.top, None);
+        f(mem);
+        let _ = BitBlt(hdc, rc.left, rc.top, w, h, Some(mem), rc.left, rc.top, SRCCOPY);
+        SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem);
+    }
+}
+
 /// Fills `rc` with a solid color through the DC's stock brush: no brush
 /// object is created or destroyed.
 pub fn fill(hdc: HDC, rc: &RECT, color: COLORREF) {

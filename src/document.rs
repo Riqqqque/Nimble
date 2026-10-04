@@ -2,7 +2,26 @@ use std::path::PathBuf;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Controls::RichEdit::CHARRANGE;
 
+use crate::data::Node;
 use crate::encoding::{Encoding, Eol};
+use crate::syntax::{Kind, Lang, State};
+
+/// How a document indents: tabs or spaces, and how wide a level is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Indent {
+    pub tabs: bool,
+    pub size: u8,
+}
+
+/// A problem found by the JSON / YAML checker, in document offsets.
+#[derive(Clone, Debug)]
+pub struct DocProblem {
+    pub start: i32,
+    pub end: i32,
+    pub line: usize,
+    pub message: String,
+    pub warning: bool,
+}
 
 /// One open document: a file path (or untitled) plus its editor control.
 /// Each tab owns a dedicated RichEdit so switching tabs preserves undo
@@ -30,6 +49,35 @@ pub struct Document {
     /// (word wrap, font pt, dark theme) this editor last applied. Hidden
     /// tabs catch up when shown instead of re-wrapping in the background.
     pub view: Option<(bool, i32, bool)>,
+
+    // ---- code features ----
+    pub lang: Lang,
+    /// Detected rather than picked by the user (re-detected on Save As).
+    pub lang_auto: bool,
+    pub indent: Indent,
+    /// Lexer state at the start of each logical line, valid as a prefix.
+    pub syn: Vec<State>,
+    /// The colored window: [start, start + text.len()) and its spans.
+    pub painted: Option<(i32, i32)>,
+    pub win_text: Vec<u16>,
+    pub win_spans: Vec<(i32, i32, Kind)>,
+    /// Caret-driven highlights currently shown: (start, end, background).
+    pub overlay: Vec<(i32, i32, u8)>,
+    pub problems: Vec<DocProblem>,
+    /// Parsed JSON / YAML, for the path under the caret.
+    pub tree: Vec<Node>,
+    /// The checker has run on the current text.
+    pub checked: bool,
+    /// (indent width << 16 | font pt) the editor's tab stops were set for.
+    pub tab_applied: u32,
+    /// Text length at the last change notification, so problem offsets past
+    /// an edit can shift with the text until the next check.
+    pub known_len: i32,
+    /// What each character from `styles_at` on was last painted with
+    /// (code::UNKNOWN where that isn't known), so repaints only touch
+    /// characters whose look changed.
+    pub styles: Vec<u16>,
+    pub styles_at: i32,
 }
 
 impl Document {
@@ -47,6 +95,21 @@ impl Document {
             sel_prev: CHARRANGE::default(),
             sel_last: CHARRANGE::default(),
             view: None,
+            lang: Lang::Plain,
+            lang_auto: true,
+            indent: Indent { tabs: false, size: 4 },
+            syn: vec![State::default()],
+            painted: None,
+            win_text: Vec::new(),
+            win_spans: Vec::new(),
+            overlay: Vec::new(),
+            problems: Vec::new(),
+            tree: Vec::new(),
+            checked: false,
+            tab_applied: 0,
+            known_len: 0,
+            styles: Vec::new(),
+            styles_at: 0,
         }
     }
 

@@ -14,7 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::app::{self, App, scale, wide};
-use crate::draw::Aa;
+use crate::draw::{self, Aa};
 use crate::theme::{self, Theme, ThemeMode};
 
 // ---- key bindings ----------------------------------------------------------
@@ -95,10 +95,15 @@ pub fn key_name(vk: u16) -> String {
                 }
             }
         }
-        // The _EX mapping flags extended keys (Delete, Home, arrows) with an
-        // E0 prefix; without bit 24 they'd be named as their numpad twins.
-        let sc = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX);
-        let ext = if sc & 0xFF00 == 0xE000 { 1 << 24 } else { 0 };
+        // Navigation keys share scan codes with the numpad; without the
+        // extended bit they'd be named "Num Del", "Num 7"... MapVirtualKey's
+        // _EX mode doesn't reliably report them, so list them here.
+        let sc = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC);
+        let extended = [
+            VK_PRIOR, VK_NEXT, VK_END, VK_HOME, VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, VK_INSERT,
+            VK_DELETE, VK_DIVIDE, VK_NUMLOCK, VK_RCONTROL, VK_RMENU, VK_APPS, VK_SNAPSHOT,
+        ];
+        let ext = if extended.contains(&VIRTUAL_KEY(vk)) { 1 << 24 } else { 0 };
         let mut buf = [0u16; 48];
         let n = GetKeyNameTextW((((sc & 0xFF) << 16) | ext | (1 << 25)) as i32, &mut buf);
         let raw = if n > 0 {
@@ -209,15 +214,36 @@ pub struct Prefs {
     pub word_wrap: bool,
     pub status_bar: bool,
     pub font_pt: i32,
+    pub syntax: bool,
+    pub rainbow: bool,
+    pub match_brackets: bool,
+    pub occurrences: bool,
+    pub validate: bool,
+    pub auto_close: bool,
+    pub insert_spaces: bool,
+    pub trim_on_save: bool,
+    pub final_newline: bool,
+    pub tab_size: u32,
 }
 
 pub fn load_prefs() -> Prefs {
+    let on = |name: &str, def: u32| reg_read("", name).unwrap_or(def) != 0;
     Prefs {
-        line_numbers: reg_read("", "LineNumbers").unwrap_or(1) != 0,
-        auto_indent: reg_read("", "AutoIndent").unwrap_or(1) != 0,
-        word_wrap: reg_read("", "WordWrap").unwrap_or(1) != 0,
-        status_bar: reg_read("", "StatusBar").unwrap_or(1) != 0,
+        line_numbers: on("LineNumbers", 1),
+        auto_indent: on("AutoIndent", 1),
+        word_wrap: on("WordWrap", 1),
+        status_bar: on("StatusBar", 1),
         font_pt: reg_read("", "FontPt").unwrap_or(11).clamp(6, 72) as i32,
+        syntax: on("SyntaxHighlight", 1),
+        rainbow: on("RainbowBrackets", 1),
+        match_brackets: on("MatchBrackets", 1),
+        occurrences: on("Occurrences", 1),
+        validate: on("Validate", 1),
+        auto_close: on("AutoClose", 1),
+        insert_spaces: on("InsertSpaces", 1),
+        trim_on_save: on("TrimOnSave", 0),
+        final_newline: on("FinalNewline", 0),
+        tab_size: reg_read("", "TabSize").unwrap_or(4).clamp(1, 8),
     }
 }
 
@@ -231,21 +257,34 @@ const SET_CLASS: PCWSTR = w!("NimbleSettings");
 
 // Hit-test ids for interactive rows.
 const ID_THEME: u32 = 1; // + ThemeMode as u32
-const ID_CHECK: u32 = 10; // + pref index
 const ID_FONT_MINUS: u32 = 20;
 const ID_FONT_PLUS: u32 = 21;
-const ID_BIND: u32 = 30; // + action index
+const ID_TAB_MINUS: u32 = 22;
+const ID_TAB_PLUS: u32 = 23;
 const ID_RESET: u32 = 60;
 const ID_DONE: u32 = 61;
 const ID_SCROLLBAR: u32 = 70;
+const ID_CHECK: u32 = 100; // + pref index
+const ID_BIND: u32 = 200; // + action index
 
-// Pref checkbox rows, in display order.
-const PREFS: [(&str, &str); 4] = [
+// Pref checkbox rows, in display order: (label, registry name). The first
+// EDITOR_PREFS sit under "Editor", the rest under "Code".
+const PREFS: [(&str, &str); 13] = [
     ("Line numbers", "LineNumbers"),
     ("Status bar", "StatusBar"),
     ("Word wrap", "WordWrap"),
     ("Auto-indent new lines", "AutoIndent"),
+    ("Syntax highlighting", "SyntaxHighlight"),
+    ("Rainbow brackets", "RainbowBrackets"),
+    ("Highlight matching brackets", "MatchBrackets"),
+    ("Highlight other uses of the word at the caret", "Occurrences"),
+    ("Check JSON and YAML for mistakes as you type", "Validate"),
+    ("Auto-close brackets and quotes", "AutoClose"),
+    ("Indent code with spaces by default", "InsertSpaces"),
+    ("Trim trailing whitespace on save", "TrimOnSave"),
+    ("End the file with a newline on save", "FinalNewline"),
 ];
+const EDITOR_PREFS: usize = 4;
 
 struct SWin {
     app: *mut App,
@@ -296,18 +335,21 @@ fn build_rows(s: &SWin, w: i32) -> Vec<(u32, RECT, RowKind)> {
     y += row_h + sc(6);
     // Editor
     header("Editor", &mut y, &mut rows);
-    for (i, (name, _)) in PREFS.iter().enumerate() {
+    let check = |i: usize, y: &mut i32, rows: &mut Vec<(u32, RECT, RowKind)>| {
         rows.push((
             ID_CHECK + i as u32,
             RECT {
                 left: pad,
-                top: y,
+                top: *y,
                 right: w - pad,
-                bottom: y + row_h,
+                bottom: *y + row_h,
             },
-            RowKind::Check(i as u32, name),
+            RowKind::Check(i as u32, PREFS[i].0),
         ));
-        y += row_h;
+        *y += row_h;
+    };
+    for i in 0..EDITOR_PREFS {
+        check(i, &mut y, &mut rows);
     }
     rows.push((
         0,
@@ -318,6 +360,22 @@ fn build_rows(s: &SWin, w: i32) -> Vec<(u32, RECT, RowKind)> {
             bottom: y + row_h,
         },
         RowKind::FontSize,
+    ));
+    y += row_h + sc(6);
+    // Code
+    header("Code", &mut y, &mut rows);
+    for i in EDITOR_PREFS..PREFS.len() {
+        check(i, &mut y, &mut rows);
+    }
+    rows.push((
+        0,
+        RECT {
+            left: pad,
+            top: y,
+            right: w - pad,
+            bottom: y + row_h,
+        },
+        RowKind::TabSize,
     ));
     y += row_h + sc(6);
     // Shortcuts
@@ -381,6 +439,7 @@ enum RowKind {
     ThemeRow,
     Check(u32, &'static str),
     FontSize,
+    TabSize,
     BindRow(usize),
 }
 
@@ -453,13 +512,14 @@ fn hit_test(s: &SWin, w: i32, h: i32, x: i32, y: i32) -> u32 {
                     .map(|i| ID_THEME + i as u32)
                     .unwrap_or(0);
             }
-            RowKind::FontSize => {
+            RowKind::FontSize | RowKind::TabSize => {
                 let (minus, _, plus) = font_buttons(&rc, s.dpi);
+                let font = matches!(kind, RowKind::FontSize);
                 if crate::app::pt_in_rect(&minus, x, y) {
-                    return ID_FONT_MINUS;
+                    return if font { ID_FONT_MINUS } else { ID_TAB_MINUS };
                 }
                 if crate::app::pt_in_rect(&plus, x, y) {
-                    return ID_FONT_PLUS;
+                    return if font { ID_FONT_PLUS } else { ID_TAB_PLUS };
                 }
                 return 0;
             }
@@ -600,13 +660,7 @@ fn paint(s: &SWin, hdc: HDC, w: i32, h: i32) {
                     if s.hot == id {
                         aa.fill_rounded(&rc, sc(5), false, th.menu_hover);
                     }
-                    let on = match PREFS[idx as usize].1 {
-                        "LineNumbers" => app.line_numbers,
-                        "StatusBar" => app.show_status,
-                        "WordWrap" => app.word_wrap,
-                        "AutoIndent" => app.auto_indent,
-                        _ => false,
-                    };
+                    let on = app.pref(PREFS[idx as usize].1);
                     let box_s = sc(16);
                     let bx = RECT {
                         left: rc.left + sc(8),
@@ -638,17 +692,18 @@ fn paint(s: &SWin, hdc: HDC, w: i32, h: i32) {
                     let n = t.len() - 1;
                     DrawTextW(hdc, &mut t[..n], &mut r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 }
-                RowKind::FontSize => {
+                RowKind::FontSize | RowKind::TabSize => {
+                    let font = matches!(kind, RowKind::FontSize);
                     SetTextColor(hdc, th.menu_fg);
                     let mut r = rc;
                     r.left += sc(8);
-                    let mut t = wide("Editor font size");
+                    let mut t = wide(if font { "Editor font size" } else { "Default indent width" });
                     let n = t.len() - 1;
                     DrawTextW(hdc, &mut t[..n], &mut r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                     let (minus, val, plus) = font_buttons(&rc, d);
-                    for (rc2, label, hot_id) in
-                        [(minus, "−", ID_FONT_MINUS), (plus, "+", ID_FONT_PLUS)]
-                    {
+                    let (minus_id, plus_id) =
+                        if font { (ID_FONT_MINUS, ID_FONT_PLUS) } else { (ID_TAB_MINUS, ID_TAB_PLUS) };
+                    for (rc2, label, hot_id) in [(minus, "−", minus_id), (plus, "+", plus_id)] {
                         let hot = s.hot == hot_id;
                         aa.fill_rounded(
                             &rc2,
@@ -670,7 +725,11 @@ fn paint(s: &SWin, hdc: HDC, w: i32, h: i32) {
                     }
                     SetTextColor(hdc, th.menu_fg);
                     let mut rv = val;
-                    let mut tv = wide(&format!("{} pt", app.edit_pt));
+                    let mut tv = wide(&if font {
+                        format!("{} pt", app.edit_pt)
+                    } else {
+                        format!("{} spaces", app.tab_size)
+                    });
                     let nv = tv.len() - 1;
                     DrawTextW(
                         hdc,
@@ -746,7 +805,7 @@ fn paint(s: &SWin, hdc: HDC, w: i32, h: i32) {
         let _ = DeleteObject(HGDIOBJ(bb.0));
 
         for (r, label, id) in [
-            (reset, "Restore defaults", ID_RESET),
+            (reset, "Reset shortcuts", ID_RESET),
             (done, "Done", ID_DONE),
         ] {
             let hot = s.hot == id;
@@ -783,22 +842,8 @@ fn paint(s: &SWin, hdc: HDC, w: i32, h: i32) {
 fn toggle_pref(s: &mut SWin, idx: u32) {
     unsafe {
         let app = &mut *s.app;
-        let (name, val) = match PREFS[idx as usize].1 {
-            "LineNumbers" => ("LineNumbers", !app.line_numbers),
-            "StatusBar" => ("StatusBar", !app.show_status),
-            "WordWrap" => ("WordWrap", !app.word_wrap),
-            "AutoIndent" => ("AutoIndent", !app.auto_indent),
-            _ => return,
-        };
-        save_pref(name, val as u32);
-        match name {
-            "LineNumbers" => app.line_numbers = val,
-            "StatusBar" => app.show_status = val,
-            "WordWrap" => app.word_wrap = val,
-            "AutoIndent" => app.auto_indent = val,
-            _ => {}
-        }
-        app.apply_prefs();
+        let name = PREFS[idx as usize].1;
+        app.set_pref(name, !app.pref(name));
     }
 }
 
@@ -896,6 +941,13 @@ fn on_click(s: &mut SWin, hwnd: HWND, id: u32) {
                 save_pref("FontPt", app.edit_pt as u32);
                 app.apply_font_size();
             }
+            ID_TAB_MINUS | ID_TAB_PLUS => {
+                // 2, 4 and 8 are the widths people actually use.
+                let steps = [1, 2, 3, 4, 8];
+                let k = steps.iter().position(|&v| v >= app.tab_size).unwrap_or(3);
+                let k = if id == ID_TAB_MINUS { k.saturating_sub(1) } else { (k + 1).min(steps.len() - 1) };
+                app.set_tab_size(steps[k]);
+            }
             x if (ID_BIND..ID_BIND + app::ACTIONS.len() as u32).contains(&x) => {
                 s.capture = (x - ID_BIND) as i32;
             }
@@ -954,7 +1006,7 @@ unsafe extern "system" fn settings_proc(
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                paint(st, hdc, w, h);
+                draw::buffered(hdc, &rc, |mem| paint(st, mem, w, h));
                 let _ = EndPaint(hwnd, &mut ps);
                 LRESULT(0)
             }
@@ -1057,6 +1109,15 @@ unsafe extern "system" fn settings_proc(
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// Repaints Settings (if open) after a preference changed elsewhere.
+pub fn refresh(app: &App) {
+    if !app.settings_hwnd.0.is_null() {
+        unsafe {
+            let _ = InvalidateRect(Some(app.settings_hwnd), None, false);
         }
     }
 }

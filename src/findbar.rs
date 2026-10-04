@@ -14,7 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::app::{self, App, hiword, pt_in_rect, scale, sm, wide};
-use crate::draw::Aa;
+use crate::draw::{self, Aa};
 use crate::theme;
 
 pub const BAR_CLASS: PCWSTR = w!("NimbleFindBar");
@@ -498,7 +498,7 @@ unsafe extern "system" fn bar_proc(
                 let hdc = BeginPaint(hwnd, &mut ps);
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
-                paint(st, hdc, rc.right, rc.bottom);
+                draw::buffered(hdc, &rc, |mem| paint(st, mem, rc.right, rc.bottom));
                 let _ = EndPaint(hwnd, &mut ps);
                 LRESULT(0)
             }

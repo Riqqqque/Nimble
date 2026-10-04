@@ -58,6 +58,39 @@ pub struct Theme {
     pub menu_sep: COLORREF,   // separator lines
     pub accent: COLORREF,     // brand orange, matches the logo
     pub danger: COLORREF,     // "no results" and other error hints
+    pub warn: COLORREF,       // warnings (duplicate keys...)
+    pub syn: Syntax,
+}
+
+/// Code colors (VS Code's Dark+ / Light+ families, tuned to Nimble's
+/// backgrounds).
+#[derive(Clone, Copy)]
+pub struct Syntax {
+    pub comment: COLORREF,
+    pub string: COLORREF,
+    pub escape: COLORREF,
+    pub number: COLORREF,
+    pub keyword: COLORREF,
+    pub literal: COLORREF,
+    pub type_: COLORREF,
+    pub function: COLORREF,
+    pub key: COLORREF,
+    pub tag: COLORREF,
+    pub attr: COLORREF,
+    pub heading: COLORREF,
+    pub emphasis: COLORREF,
+    pub code: COLORREF,
+    pub link: COLORREF,
+    pub directive: COLORREF,
+    pub variable: COLORREF,
+    pub anchor: COLORREF,
+    pub punct: COLORREF,
+    pub brackets: [COLORREF; 3],
+    /// Backgrounds: matching bracket pair, unmatched bracket, other
+    /// occurrences of the selected word.
+    pub match_bg: COLORREF,
+    pub mismatch_bg: COLORREF,
+    pub occurrence_bg: COLORREF,
 }
 
 pub fn light_theme() -> Theme {
@@ -78,6 +111,32 @@ pub fn light_theme() -> Theme {
         menu_sep: rgb(0xD4, 0xD4, 0xD4),
         accent: rgb(0xE8, 0x55, 0x1E),
         danger: rgb(0xC4, 0x2B, 0x1C),
+        warn: rgb(0xB8, 0x86, 0x00),
+        syn: Syntax {
+            comment: rgb(0x00, 0x80, 0x00),
+            string: rgb(0xA3, 0x15, 0x15),
+            escape: rgb(0xEE, 0x00, 0x00),
+            number: rgb(0x09, 0x86, 0x58),
+            keyword: rgb(0x00, 0x00, 0xFF),
+            literal: rgb(0x00, 0x00, 0xFF),
+            type_: rgb(0x26, 0x7F, 0x99),
+            function: rgb(0x79, 0x5E, 0x26),
+            key: rgb(0x04, 0x51, 0xA5),
+            tag: rgb(0x80, 0x00, 0x00),
+            attr: rgb(0xE5, 0x00, 0x00),
+            heading: rgb(0x00, 0x00, 0x80),
+            emphasis: rgb(0x00, 0x00, 0x80),
+            code: rgb(0xA3, 0x15, 0x15),
+            link: rgb(0x00, 0x66, 0xCC),
+            directive: rgb(0xAF, 0x00, 0xDB),
+            variable: rgb(0x00, 0x10, 0x80),
+            anchor: rgb(0xAF, 0x00, 0xDB),
+            punct: rgb(0x80, 0x80, 0x80),
+            brackets: [rgb(0x04, 0x31, 0xFA), rgb(0x31, 0x93, 0x31), rgb(0x7B, 0x38, 0x14)],
+            match_bg: rgb(0xC9, 0xDB, 0xF0),
+            mismatch_bg: rgb(0xF6, 0xC9, 0xC6),
+            occurrence_bg: rgb(0xE4, 0xE9, 0xF0),
+        },
     }
 }
 
@@ -99,6 +158,32 @@ pub fn dark_theme() -> Theme {
         menu_sep: rgb(0x40, 0x40, 0x40),
         accent: rgb(0xE8, 0x55, 0x1E),
         danger: rgb(0xFF, 0x7A, 0x6E),
+        warn: rgb(0xE5, 0xC0, 0x7B),
+        syn: Syntax {
+            comment: rgb(0x6A, 0x99, 0x55),
+            string: rgb(0xCE, 0x91, 0x78),
+            escape: rgb(0xD7, 0xBA, 0x7D),
+            number: rgb(0xB5, 0xCE, 0xA8),
+            keyword: rgb(0x56, 0x9C, 0xD6),
+            literal: rgb(0x56, 0x9C, 0xD6),
+            type_: rgb(0x4E, 0xC9, 0xB0),
+            function: rgb(0xDC, 0xDC, 0xAA),
+            key: rgb(0x9C, 0xDC, 0xFE),
+            tag: rgb(0x56, 0x9C, 0xD6),
+            attr: rgb(0x9C, 0xDC, 0xFE),
+            heading: rgb(0x56, 0x9C, 0xD6),
+            emphasis: rgb(0xC5, 0x86, 0xC0),
+            code: rgb(0xCE, 0x91, 0x78),
+            link: rgb(0x4F, 0xC1, 0xFF),
+            directive: rgb(0xC5, 0x86, 0xC0),
+            variable: rgb(0x9C, 0xDC, 0xFE),
+            anchor: rgb(0xC5, 0x86, 0xC0),
+            punct: rgb(0x80, 0x80, 0x80),
+            brackets: [rgb(0xFF, 0xD7, 0x00), rgb(0xDA, 0x70, 0xD6), rgb(0x17, 0x9F, 0xFF)],
+            match_bg: rgb(0x3E, 0x4D, 0x63),
+            mismatch_bg: rgb(0x6B, 0x2C, 0x2C),
+            occurrence_bg: rgb(0x34, 0x3A, 0x46),
+        },
     }
 }
 
