@@ -59,6 +59,8 @@ pub struct Theme {
     pub accent: COLORREF,     // brand orange, matches the logo
     pub danger: COLORREF,     // "no results" and other error hints
     pub warn: COLORREF,       // warnings (duplicate keys...)
+    pub gutter_bg: COLORREF,  // line-number gutter, a shade off the text
+    pub gutter_rule: COLORREF, // hairline between gutter and text
     pub syn: Syntax,
 }
 
@@ -112,6 +114,8 @@ pub fn light_theme() -> Theme {
         accent: rgb(0xE8, 0x55, 0x1E),
         danger: rgb(0xC4, 0x2B, 0x1C),
         warn: rgb(0xB8, 0x86, 0x00),
+        gutter_bg: rgb(0xF8, 0xF8, 0xF8),
+        gutter_rule: rgb(0xE3, 0xE3, 0xE3),
         syn: Syntax {
             comment: rgb(0x00, 0x80, 0x00),
             string: rgb(0xA3, 0x15, 0x15),
@@ -159,6 +163,8 @@ pub fn dark_theme() -> Theme {
         accent: rgb(0xE8, 0x55, 0x1E),
         danger: rgb(0xFF, 0x7A, 0x6E),
         warn: rgb(0xE5, 0xC0, 0x7B),
+        gutter_bg: rgb(0x1C, 0x1C, 0x1C),
+        gutter_rule: rgb(0x33, 0x33, 0x33),
         syn: Syntax {
             comment: rgb(0x6A, 0x99, 0x55),
             string: rgb(0xCE, 0x91, 0x78),

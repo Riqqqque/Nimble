@@ -680,7 +680,17 @@ impl App {
                         out.push((p.min(q), p.min(q) + 1, BG_MATCH as u8));
                         out.push((p.max(q), p.max(q) + 1, BG_MATCH as u8));
                     }
-                    None => out.push((p, p + 1, BG_MISMATCH as u8)),
+                    // Unmatched only if the colored window reaches the end
+                    // of the text in the direction the partner would be;
+                    // otherwise it's just off screen.
+                    None => {
+                        let opener = at(p).is_some_and(|c| c == 0x28 || c == 0x5B || c == 0x7B);
+                        let (ws, we) = d.painted.unwrap_or_default();
+                        let sure = if opener { we >= text_len(d.edit) } else { ws <= 0 };
+                        if sure {
+                            out.push((p, p + 1, BG_MISMATCH as u8));
+                        }
+                    }
                 }
             }
         }

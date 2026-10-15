@@ -162,6 +162,11 @@ const EDIT_ID_BASE: usize = 4096;
 const EDIT_EVENTS: u32 = ENM_CHANGE | ENM_SELCHANGE | ENM_SCROLL;
 const EDIT_SUBCLASS: usize = 2;
 const POPUP_SUBCLASS: usize = 4;
+/// Gutter padding (at 96 dpi): room for problem dots on the left, and a
+/// gap before the rule that separates the numbers from the text.
+const GUTTER_PAD_L: i32 = 20;
+const GUTTER_PAD_R: i32 = 14;
+
 /// Deferred line recount for large documents (see gutter_lines).
 const TIMER_RECOUNT: usize = 1;
 /// Documents up to this many chars recount lines immediately after edits.
@@ -2162,7 +2167,7 @@ impl App {
         let lines = self.gutter_lines(i).max(1);
         let digits = (lines.ilog10() as i32 + 1).max(2);
         self.ensure_gutter_font();
-        scale(14, self.dpi) + digits * self.gutter_digit_w + scale(10, self.dpi)
+        scale(GUTTER_PAD_L, self.dpi) + digits * self.gutter_digit_w + scale(GUTTER_PAD_R, self.dpi)
     }
 
     /// Editor face at the active tab's zoomed size, so gutter numbers sit
@@ -2174,7 +2179,9 @@ impl App {
         if key == self.gutter_key && !self.gutter_font.0.is_null() {
             return;
         }
-        let px = self.edit_pt * self.dpi as i32 * zoom / (72 * 100);
+        // Rounded the way RichEdit rounds its own point size, so digits are
+        // exactly the height of the text beside them.
+        let px = (self.edit_pt * self.dpi as i32 * zoom + 3600) / (72 * 100);
         let face = wide(&self.edit_face);
         unsafe {
             let _ = DeleteObject(HGDIOBJ(self.gutter_font.0));
@@ -2460,14 +2467,17 @@ impl App {
                 right: self.gutter_w,
                 bottom,
             };
-            draw::fill(hdc, &band, th.edit_bg);
+            draw::fill(hdc, &band, th.gutter_bg);
+            // Hairline between the numbers and the text.
+            let rule = RECT { left: band.right - 1, ..band };
+            draw::fill(hdc, &rule, th.gutter_rule);
 
             let old = SelectObject(hdc, HGDIOBJ(self.gutter_font.0));
             SetBkMode(hdc, TRANSPARENT);
-            let align = SetTextAlign(hdc, TA_RIGHT | TA_TOP);
+            let align = SetTextAlign(hdc, TA_LEFT | TA_TOP);
             let saved = SaveDC(hdc);
             let _ = IntersectClipRect(hdc, band.left, band.top, band.right, band.bottom);
-            let x = band.right - scale(10, self.dpi);
+            let x = band.left + scale(GUTTER_PAD_L, self.dpi);
             let first = sm(edit, EM_GETFIRSTVISIBLELINE, 0, 0).0.max(0);
             let mut digits = [0u16; 20];
             let mut row = first;
@@ -2507,7 +2517,7 @@ impl App {
                 if self.validate && k < probs.len() && probs[k].line == ln {
                     let error = probs[k..].iter().take_while(|p| p.line == ln).any(|p| !p.warning);
                     let r = scale(3, self.dpi);
-                    let cx = band.left + scale(7, self.dpi);
+                    let cx = band.left + scale(9, self.dpi);
                     let cy = y + line_h / 2;
                     aa.fill_ellipse(
                         &RECT { left: cx - r, top: cy - r, right: cx + r, bottom: cy + r },
